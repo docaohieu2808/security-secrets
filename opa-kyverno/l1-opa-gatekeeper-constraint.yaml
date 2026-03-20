@@ -1,0 +1,250 @@
+# =============================================================================
+# l1-opa-gatekeeper-constraint.yaml — OPA Gatekeeper: K8s admission control constraints
+#
+# OPA Gatekeeper enforces policy at admission time — rejecting non-compliant
+# resources before they are persisted to etcd.
+#
+# Prerequisites:
+#   helm repo add gatekeeper https://open-policy-agent.github.io/gatekeeper/charts
+#   helm install gatekeeper gatekeeper/gatekeeper --namespace gatekeeper-system --create-namespace
+#
+# Apply:
+#   kubectl apply -f l1-opa-gatekeeper-constraint.yaml
+#
+# Order of operations:
+#   1. Apply ConstraintTemplate (defines the policy schema + Rego logic)
+#   2. Apply Constraint (instantiates the template with parameters)
+# =============================================================================
+
+---
+# ConstraintTemplate 1: Require specific labels on all namespaced resources
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+  annotations:
+    description: "Requires specified labels to be present on resources"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+
+        violation[{"msg": msg}] {
+          provided := {label | input.review.object.metadata.labels[label]}
+          required := {label | label := input.parameters.labels[_]}
+          missing  := required - provided
+          count(missing) > 0
+          msg := sprintf("Resource '%v/%v' is missing required labels: %v",
+            [input.review.object.kind, input.review.object.metadata.name, missing])
+        }
+
+---
+# Constraint 1a: Require app labels on Deployments and StatefulSets
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: require-app-labels-on-workloads
+spec:
+  enforcementAction: deny      # deny | dryrun | warn
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+    excludedNamespaces:
+      - kube-system
+      - gatekeeper-system
+      - cert-manager
+  parameters:
+    labels:
+      - "app.kubernetes.io/name"
+      - "app.kubernetes.io/version"
+      - "app.kubernetes.io/managed-by"
+
+---
+# Constraint 1b: Require team label on all Namespaces
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: require-team-label-on-namespaces
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Namespace"]
+    excludedNamespaces:
+      - kube-system
+      - default
+      - gatekeeper-system
+  parameters:
+    labels:
+      - "team"
+      - "environment"
+
+---
+# ConstraintTemplate 2: Deny privileged containers
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdenyprivilegedcontainers
+  annotations:
+    description: "Denies containers running in privileged mode"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDenyPrivilegedContainers
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sdenyprivilegedcontainers
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          container.securityContext.privileged == true
+          msg := sprintf("Container '%v' in '%v' is running privileged. Remove securityContext.privileged=true",
+            [container.name, input.review.object.metadata.name])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.initContainers[_]
+          container.securityContext.privileged == true
+          msg := sprintf("Init container '%v' in '%v' is running privileged. Remove securityContext.privileged=true",
+            [container.name, input.review.object.metadata.name])
+        }
+
+---
+# Constraint 2: Enforce no privileged containers across all workload namespaces
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDenyPrivilegedContainers
+metadata:
+  name: deny-privileged-containers-cluster-wide
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["", "apps", "batch"]
+        kinds: ["Pod", "Deployment", "DaemonSet", "StatefulSet", "Job", "CronJob"]
+    excludedNamespaces:
+      - kube-system
+      - gatekeeper-system
+      - falco       # Falco needs privileged for eBPF
+
+---
+# ConstraintTemplate 3: Require resource limits on all containers
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequireresourcelimits
+  annotations:
+    description: "Requires CPU and memory limits on all containers"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequireResourceLimits
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequireresourcelimits
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.resources.limits.memory
+          msg := sprintf("Container '%v' has no memory limit. Add resources.limits.memory", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.resources.limits.cpu
+          msg := sprintf("Container '%v' has no CPU limit. Add resources.limits.cpu", [container.name])
+        }
+
+---
+# Constraint 3: Enforce resource limits on all Pods/workloads
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequireResourceLimits
+metadata:
+  name: require-resource-limits-on-all-containers
+spec:
+  enforcementAction: warn     # warn first, switch to deny after teams remediate
+  match:
+    kinds:
+      - apiGroups: ["", "apps", "batch"]
+        kinds: ["Pod", "Deployment", "StatefulSet", "DaemonSet", "Job"]
+    excludedNamespaces:
+      - kube-system
+      - gatekeeper-system
+
+---
+# ConstraintTemplate 4: Allowed container registries
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sallowedregistries
+  annotations:
+    description: "Restricts container images to approved registries only"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sAllowedRegistries
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            registries:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sallowedregistries
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not starts_with_allowed(container.image)
+          msg := sprintf("Container '%v' uses image '%v' from an unapproved registry. Allowed: %v",
+            [container.name, container.image, input.parameters.registries])
+        }
+
+        starts_with_allowed(image) {
+          registry := input.parameters.registries[_]
+          startswith(image, registry)
+        }
+
+---
+# Constraint 4: Only allow images from approved registries
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAllowedRegistries
+metadata:
+  name: restrict-images-to-approved-registries
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["", "apps", "batch"]
+        kinds: ["Pod", "Deployment", "StatefulSet", "DaemonSet", "Job"]
+    excludedNamespaces:
+      - kube-system
+      - gatekeeper-system
+  parameters:
+    registries:
+      - "gcr.io/my-org/"           # Internal GCR
+      - "registry.company.com/"    # Private Harbor
+      - "ghcr.io/my-org/"          # GitHub Packages
+      - "public.ecr.aws/amazonlinux/" # Approved public images

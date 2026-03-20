@@ -1,0 +1,134 @@
+# =============================================================================
+# l1-install-operator.yaml — External Secrets Operator: Helm install values
+#
+# External Secrets Operator (ESO) syncs secrets FROM external providers
+# (Vault, AWS SSM/SecretsManager, GCP Secret Manager, Azure KeyVault, etc.)
+# INTO native Kubernetes Secrets.
+#
+# Architecture:
+#   ExternalSecret CR → ESO controller → external provider → K8s Secret
+#
+# Install:
+#   helm repo add external-secrets https://charts.external-secrets.io
+#   helm repo update
+#   helm install external-secrets external-secrets/external-secrets \
+#     --namespace external-secrets --create-namespace \
+#     --values l1-install-operator.yaml
+#
+# Verify:
+#   kubectl get pods -n external-secrets
+#   kubectl get crds | grep external-secrets
+# =============================================================================
+
+# --- Core controller ---------------------------------------------------------
+replicaCount: 2     # HA — run 2 replicas with leader election
+
+image:
+  repository: ghcr.io/external-secrets/external-secrets
+  pullPolicy: IfNotPresent
+  tag: ""    # Uses chart appVersion by default
+
+# --- Leader election (required for replicaCount > 1) ------------------------
+leaderElect: true
+
+# --- Resources ---------------------------------------------------------------
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    cpu: 100m
+    memory: 128Mi
+
+# --- Security context --------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+  runAsNonRoot: true
+
+# --- Service account ---------------------------------------------------------
+serviceAccount:
+  create: true
+  name: external-secrets
+  annotations:
+    # GKE Workload Identity — binds K8s SA to GCP SA for GCP Secret Manager
+    # iam.gke.io/gcp-service-account: external-secrets@MY_PROJECT.iam.gserviceaccount.com
+
+    # EKS IRSA — binds K8s SA to AWS IAM role for AWS SSM/SecretsManager
+    # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/external-secrets-role
+
+# --- Webhook (validates ExternalSecret / SecretStore CRs) --------------------
+webhook:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 50m
+      memory: 64Mi
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+
+# --- Cert Controller (manages webhook TLS certs) ----------------------------
+certController:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 50m
+      memory: 64Mi
+
+# --- Reconcile interval ------------------------------------------------------
+# How often ESO polls the external provider for secret changes
+# Override per ExternalSecret with spec.refreshInterval
+# Global default:
+extraArgs:
+  metrics-addr: ":8080"
+  # polling-interval is set per ExternalSecret — no global override needed
+
+# --- Metrics -----------------------------------------------------------------
+metrics:
+  service:
+    enabled: true
+    port: 8080
+
+serviceMonitor:
+  enabled: false    # Set true with Prometheus Operator
+
+# --- RBAC --------------------------------------------------------------------
+rbac:
+  create: true
+
+# --- CRDs -------------------------------------------------------------------
+installCRDs: true    # Let Helm manage CRDs (simpler upgrades)
+
+# --- Node placement ----------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: external-secrets
+          topologyKey: kubernetes.io/hostname
+
+# --- Pod disruption budget ---------------------------------------------------
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1

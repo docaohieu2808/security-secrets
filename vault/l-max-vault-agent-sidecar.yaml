@@ -1,0 +1,231 @@
+# =============================================================================
+# l-max-vault-agent-sidecar.yaml — Vault: Agent sidecar injector for Kubernetes
+#
+# Vault Agent Injector uses a MutatingWebhook to automatically inject a Vault
+# Agent sidecar into annotated Pods. The sidecar authenticates to Vault using
+# Kubernetes ServiceAccount tokens (no static credentials needed) and renders
+# secrets into shared in-memory volumes.
+#
+# Prerequisites:
+#   helm repo add hashicorp https://helm.releases.hashicorp.com
+#   helm install vault hashicorp/vault --namespace vault --create-namespace \
+#     --set "injector.enabled=true" \
+#     --set "server.dev.enabled=true"   # dev only; use HA Raft for production
+#
+# Setup Kubernetes auth in Vault (run once):
+#   vault auth enable kubernetes
+#   vault write auth/kubernetes/config \
+#     kubernetes_host="https://$KUBERNETES_PORT_443_TCP_ADDR:443"
+#
+# Then apply this file:
+#   kubectl apply -f l-max-vault-agent-sidecar.yaml
+# =============================================================================
+
+---
+# ServiceAccount for the example application
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: myapp-service-account
+  namespace: myapp
+  annotations:
+    # Optional: bind to Vault role by convention
+    vault.hashicorp.com/role: myapp-role
+
+---
+# Vault policy bound to this ServiceAccount (apply via vault CLI before deploying):
+# vault policy write myapp-policy - <<EOF
+# path "secret/data/myapp/*" {
+#   capabilities = ["read"]
+# }
+# path "database/creds/myapp-readonly" {
+#   capabilities = ["read"]
+# }
+# path "pki-int/issue/web-server" {
+#   capabilities = ["create", "update"]
+# }
+# EOF
+#
+# vault write auth/kubernetes/role/myapp-role \
+#   bound_service_account_names=myapp-service-account \
+#   bound_service_account_namespaces=myapp \
+#   policies=myapp-policy \
+#   ttl=1h
+
+---
+# Example Deployment with Vault Agent sidecar injection annotations
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-with-vault-sidecar
+  namespace: myapp
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: kubectl
+    team: platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: myapp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: myapp
+      annotations:
+        # ---- Core injection annotations -------------------------------------
+        # Enable Vault Agent injection for this pod
+        vault.hashicorp.com/agent-inject: "true"
+
+        # Vault role to authenticate as (must be configured in Vault)
+        vault.hashicorp.com/role: "myapp-role"
+
+        # ---- Secret: database credentials -----------------------------------
+        # Inject dynamic DB credentials from database secrets engine
+        # Rendered at: /vault/secrets/database-credentials
+        vault.hashicorp.com/agent-inject-secret-database-credentials: "database/creds/myapp-readonly"
+        # Template: render as shell-sourceable export statements
+        vault.hashicorp.com/agent-inject-template-database-credentials: |
+          {{- with secret "database/creds/myapp-readonly" -}}
+          export DB_USERNAME="{{ .Data.username }}"
+          export DB_PASSWORD="{{ .Data.password }}"
+          {{- end }}
+
+        # ---- Secret: app config from KV v2 ----------------------------------
+        # Rendered at: /vault/secrets/app-config
+        vault.hashicorp.com/agent-inject-secret-app-config: "secret/data/myapp/config"
+        vault.hashicorp.com/agent-inject-template-app-config: |
+          {{- with secret "secret/data/myapp/config" -}}
+          {
+            "stripe_key": "{{ .Data.data.stripe_secret }}",
+            "sendgrid_key": "{{ .Data.data.sendgrid_api_key }}"
+          }
+          {{- end }}
+
+        # ---- Secret: TLS certificate from PKI engine ------------------------
+        # Rendered at: /vault/secrets/tls-cert and /vault/secrets/tls-key
+        vault.hashicorp.com/agent-inject-secret-tls-cert: "pki-int/issue/web-server"
+        vault.hashicorp.com/agent-inject-template-tls-cert: |
+          {{- with secret "pki-int/issue/web-server" "common_name=myapp.internal.example.com" "ttl=24h" -}}
+          {{ .Data.certificate }}
+          {{ .Data.issuing_ca }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-tls-key: "pki-int/issue/web-server"
+        vault.hashicorp.com/agent-inject-template-tls-key: |
+          {{- with secret "pki-int/issue/web-server" "common_name=myapp.internal.example.com" "ttl=24h" -}}
+          {{ .Data.private_key }}
+          {{- end }}
+
+        # ---- Agent behavior -------------------------------------------------
+        # Keep agent running as sidecar (vs init-only for static secrets)
+        vault.hashicorp.com/agent-inject-status: "update"
+
+        # Pre-populate secrets before app container starts (init container mode)
+        vault.hashicorp.com/agent-pre-populate-only: "false"
+
+        # Agent sidecar resource limits
+        vault.hashicorp.com/agent-limits-cpu: "250m"
+        vault.hashicorp.com/agent-limits-mem: "128Mi"
+        vault.hashicorp.com/agent-requests-cpu: "50m"
+        vault.hashicorp.com/agent-requests-mem: "64Mi"
+
+        # Secret file permissions (octal)
+        vault.hashicorp.com/secret-volume-path: "/vault/secrets"
+
+        # Log level for Vault Agent (debug for troubleshooting)
+        vault.hashicorp.com/log-level: "info"
+
+        # Revoke Vault token on pod termination
+        vault.hashicorp.com/agent-revoke-on-shutdown: "true"
+        vault.hashicorp.com/agent-revoke-grace: "5s"
+
+        # Vault server address (override if not using default service)
+        vault.hashicorp.com/vault-addr: "https://vault.vault.svc.cluster.local:8200"
+        vault.hashicorp.com/ca-cert: "/vault/tls/ca.crt"
+
+    spec:
+      serviceAccountName: myapp-service-account
+
+      # Security context: run as non-root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: myapp
+          image: myapp:1.0.0
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 8080
+              name: http
+
+          # Secrets are available at /vault/secrets/ as files
+          # Source them or read directly in application startup
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Source DB credentials injected by Vault Agent
+              . /vault/secrets/database-credentials
+              # Start the application
+              exec /app/server
+
+          env:
+            - name: APP_ENV
+              value: production
+            - name: VAULT_SECRETS_PATH
+              value: /vault/secrets
+
+          volumeMounts:
+            # /vault/secrets is automatically mounted by the injector
+            # Additional app-specific mounts:
+            - name: tmp
+              mountPath: /tmp
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        # Note: /vault/secrets volume is injected automatically by the webhook
+
+---
+# Namespace with required labels (needed by Kyverno policies)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: myapp
+  labels:
+    team: platform
+    environment: production
+    # Allow Vault Agent injector webhook to operate in this namespace
+    vault.hashicorp.com/agent-injection: enabled

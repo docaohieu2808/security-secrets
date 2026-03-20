@@ -1,0 +1,67 @@
+# Secrets and credentials - NEVER commit these
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.crt
+*.csr
+*.env
+.env.*
+!.env.example
+
+# Vault tokens and credentials
+vault-token
+.vault-token
+vault-keys.json
+vault-unseal-keys.txt
+
+# SOPS encrypted files (plaintext only - encrypted ARE safe to commit)
+secrets.yaml
+secrets.json
+
+# Age private keys
+age-key.txt
+age-private.key
+
+# GCP service account keys
+*-sa-key.json
+service-account*.json
+gcp-credentials.json
+
+# AWS credentials
+credentials
+.aws/
+
+# Kubeconfig with embedded credentials
+kubeconfig-*
+*.kubeconfig
+
+# SonarQube tokens
+sonar-token.txt
+sonar.properties
+
+# Terraform state (may contain secrets)
+*.tfstate
+*.tfstate.backup
+.terraform/
+terraform.tfvars
+
+# Docker secrets
+docker-secrets/
+*.dockerconfigjson
+
+# Local override configs
+*.local.yaml
+*.local.json
+local-override.*
+
+# Logs that may contain secrets
+*.log
+audit.log
+
+# Temporary files
+*.tmp
+*.bak
+tmp/
+temp/

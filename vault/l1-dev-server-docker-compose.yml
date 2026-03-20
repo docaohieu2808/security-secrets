@@ -1,0 +1,95 @@
+# =============================================================================
+# l1-dev-server-docker-compose.yml — Vault: Local dev server via Docker Compose
+#
+# Starts HashiCorp Vault in dev mode — single-node, in-memory, auto-unsealed.
+# DEV MODE ONLY: all data lost on restart. Never use dev mode in production.
+#
+# Usage:
+#   docker compose -f l1-dev-server-docker-compose.yml up -d
+#   export VAULT_ADDR=http://127.0.0.1:8200
+#   export VAULT_TOKEN=dev-root-token
+#   vault status
+#
+# For production, use integrated storage (Raft) or Consul backend with TLS.
+# Production Helm install:
+#   helm repo add hashicorp https://helm.releases.hashicorp.com
+#   helm install vault hashicorp/vault --namespace vault --create-namespace \
+#     --set "server.ha.enabled=true" --set "server.ha.raft.enabled=true"
+# =============================================================================
+
+version: "3.8"
+
+services:
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: vault-dev
+    restart: unless-stopped
+
+    # Dev server flags:
+    #   -dev              : enable dev mode (in-memory, auto-unseal)
+    #   -dev-root-token-id: set a predictable root token for local scripting
+    #   -dev-listen-address: bind to all interfaces so host can reach it
+    command: >
+      vault server
+        -dev
+        -dev-root-token-id=dev-root-token
+        -dev-listen-address=0.0.0.0:8200
+
+    ports:
+      - "8200:8200"     # Vault API and UI
+
+    environment:
+      # Disable TLS for dev mode (required when -dev-listen-address is used)
+      VAULT_DEV_ROOT_TOKEN_ID: dev-root-token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://127.0.0.1:8200
+      # Enable Vault UI
+      VAULT_UI: "true"
+
+    cap_add:
+      # IPC_LOCK prevents Vault memory from being swapped to disk
+      # Critical in production to protect secrets from appearing in swap
+      - IPC_LOCK
+
+    volumes:
+      # Persist logs even in dev mode (optional)
+      - vault_logs:/vault/logs
+      # Mount config dir for any extra HCL config overrides
+      - vault_config:/vault/config
+
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Vault Agent — demonstrates auto-auth and template rendering locally
+  # Comment out if not needed for basic dev usage
+  # ---------------------------------------------------------------------------
+  vault-agent:
+    image: hashicorp/vault:1.17
+    container_name: vault-agent-dev
+    restart: unless-stopped
+    depends_on:
+      vault:
+        condition: service_healthy
+    command: >
+      vault agent -config=/vault/config/agent.hcl
+    environment:
+      VAULT_ADDR: http://vault:8200
+    volumes:
+      - ./agent-config:/vault/config:ro
+      - vault_agent_sink:/vault/sink
+    profiles:
+      # Only start with: docker compose --profile agent up
+      - agent
+
+volumes:
+  vault_logs:
+    driver: local
+  vault_config:
+    driver: local
+  vault_agent_sink:
+    driver: local

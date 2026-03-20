@@ -1,0 +1,115 @@
+# =============================================================================
+# l1-install-controller.yaml — Sealed Secrets: Install controller via Helm
+#
+# Sealed Secrets encrypts K8s Secrets into SealedSecret CRDs that are safe
+# to store in Git. Only the in-cluster controller can decrypt them.
+#
+# Architecture:
+#   kubeseal CLI (local) → encrypts with controller public key
+#   SealedSecret CR → stored in Git → applied to cluster
+#   Controller (in-cluster) → decrypts → creates native K8s Secret
+#
+# Install controller:
+#   helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
+#   helm repo update
+#   helm install sealed-secrets sealed-secrets/sealed-secrets \
+#     --namespace kube-system \
+#     --values l1-install-controller.yaml
+#
+# Install kubeseal CLI (Linux amd64):
+#   KUBESEAL_VERSION=$(curl -s https://api.github.com/repos/bitnami-labs/sealed-secrets/tags \
+#     | jq -r '.[0].name' | cut -c 2-)
+#   curl -OL "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-amd64.tar.gz"
+#   tar -xzf kubeseal-${KUBESEAL_VERSION}-linux-amd64.tar.gz kubeseal
+#   sudo install -m 755 kubeseal /usr/local/bin/kubeseal
+# =============================================================================
+
+# --- Controller configuration ------------------------------------------------
+image:
+  registry: docker.io
+  repository: bitnami/sealed-secrets-controller
+  tag: ""            # Leave empty to use chart default (latest stable)
+  pullPolicy: IfNotPresent
+
+# Controller runs in kube-system by default — change only if required
+# namespace: kube-system
+
+# --- Key management ----------------------------------------------------------
+# Controller generates a RSA-4096 keypair on first install.
+# The public key is used by kubeseal to encrypt. Private key stays in cluster.
+
+# Rotate sealing key every N days (0 = disable automatic rotation)
+# After rotation, old keys are kept so existing SealedSecrets still work.
+keyrenewperiod: "720h"    # 30 days
+
+# Keep N old sealing keys after rotation (for decrypting old SealedSecrets)
+# Set higher if you have long-lived SealedSecrets that may not be rotated
+acceptancepolicy: ""
+
+# --- Security ----------------------------------------------------------------
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# --- Resources ---------------------------------------------------------------
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+# --- Service -----------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8080
+  # Expose metrics for Prometheus scraping
+  metricsPort: 8081
+
+# --- Metrics / monitoring ----------------------------------------------------
+serviceMonitor:
+  enabled: false    # Set true if Prometheus Operator is installed
+  namespace: monitoring
+  labels:
+    release: prometheus
+
+# --- RBAC --------------------------------------------------------------------
+rbac:
+  create: true
+  clusterRole: true    # Controller needs cluster-wide Secret write access
+
+serviceAccount:
+  create: true
+  name: sealed-secrets-controller
+
+# --- Network policy ----------------------------------------------------------
+networkPolicy:
+  enabled: false    # Set true to restrict controller egress/ingress
+
+# --- Pod disruption budget ---------------------------------------------------
+podDisruptionBudget:
+  enabled: false
+
+# --- Node placement ----------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# --- Ingress (not recommended — controller has no web UI) --------------------
+ingress:
+  enabled: false
+
+# --- Additional sealed secrets namespaces ------------------------------------
+# By default controller watches all namespaces.
+# Restrict with: --set "commandArgs={--namespace=myapp}"
+commandArgs: []

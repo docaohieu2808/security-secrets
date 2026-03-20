@@ -1,0 +1,98 @@
+{
+  "_comment": "SonarQube Quality Gate configuration — import via API or sonar-project.properties",
+  "_usage": [
+    "Create gate via API:",
+    "  TOKEN=<your-sonar-token>",
+    "  curl -X POST 'http://localhost:9000/api/qualitygates/create' \\",
+    "    -u $TOKEN: -d 'name=Production+Security+Gate'",
+    "",
+    "Then add each condition below using:",
+    "  curl -X POST 'http://localhost:9000/api/qualitygates/create_condition' \\",
+    "    -u $TOKEN: \\",
+    "    -d 'gateId=<gate-id>&metric=<metric>&op=<GT|LT>&error=<threshold>'",
+    "",
+    "Set as default gate:",
+    "  curl -X POST 'http://localhost:9000/api/qualitygates/set_as_default' \\",
+    "    -u $TOKEN: -d 'id=<gate-id>'"
+  ],
+  "qualityGate": {
+    "name": "Production Security Gate",
+    "isDefault": true,
+    "conditions": [
+      {
+        "_desc": "Fail if any new BLOCKER severity issues introduced",
+        "metric": "new_blocker_violations",
+        "op": "GT",
+        "error": "0"
+      },
+      {
+        "_desc": "Fail if any new CRITICAL severity issues introduced",
+        "metric": "new_critical_violations",
+        "op": "GT",
+        "error": "0"
+      },
+      {
+        "_desc": "Fail if new code coverage drops below 80%",
+        "metric": "new_coverage",
+        "op": "LT",
+        "error": "80"
+      },
+      {
+        "_desc": "Fail if new code duplication exceeds 3%",
+        "metric": "new_duplicated_lines_density",
+        "op": "GT",
+        "error": "3"
+      },
+      {
+        "_desc": "Fail if any new security hotspots are unreviewed",
+        "metric": "new_security_hotspots_reviewed",
+        "op": "LT",
+        "error": "100"
+      },
+      {
+        "_desc": "Fail if security rating on new code is worse than A (1=A, 2=B, 3=C, 4=D, 5=E)",
+        "metric": "new_security_rating",
+        "op": "GT",
+        "error": "1"
+      },
+      {
+        "_desc": "Fail if reliability rating on new code is worse than A",
+        "metric": "new_reliability_rating",
+        "op": "GT",
+        "error": "1"
+      },
+      {
+        "_desc": "Fail if maintainability rating on new code is worse than A",
+        "metric": "new_maintainability_rating",
+        "op": "GT",
+        "error": "1"
+      },
+      {
+        "_desc": "Fail if new technical debt ratio exceeds 5%",
+        "metric": "new_sqale_debt_ratio",
+        "op": "GT",
+        "error": "5"
+      }
+    ]
+  },
+  "sonarProjectProperties": {
+    "_desc": "Add these to sonar-project.properties or sonar-scanner CLI args",
+    "sonar.qualitygate.wait": "true",
+    "sonar.qualitygate.timeout": "300"
+  },
+  "securityHotspotCategories": {
+    "_desc": "OWASP Top 10 categories SonarQube checks by default",
+    "categories": [
+      "A1-Injection",
+      "A2-Broken_Authentication",
+      "A3-Sensitive_Data_Exposure",
+      "A4-XML_External_Entities",
+      "A5-Broken_Access_Control",
+      "A6-Security_Misconfiguration",
+      "A7-Cross_Site_Scripting",
+      "A8-Insecure_Deserialization",
+      "A9-Using_Components_With_Known_Vulnerabilities",
+      "A10-Insufficient_Logging_and_Monitoring"
+    ]
+  }
+}

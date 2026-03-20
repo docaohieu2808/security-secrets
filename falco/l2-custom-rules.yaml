@@ -1,0 +1,220 @@
+# =============================================================================
+# l2-custom-rules.yaml — Falco Level 2: Custom runtime security detection rules
+#
+# Apply as a ConfigMap:
+#   kubectl create configmap falco-custom-rules \
+#     --from-file=custom_rules.yaml=l2-custom-rules.yaml \
+#     --namespace falco --dry-run=client -o yaml | kubectl apply -f -
+#
+# Or mount directly into Falco pod at /etc/falco/rules.d/custom_rules.yaml
+#
+# Rule anatomy:
+#   - rule:      unique rule name
+#   - desc:      human-readable description
+#   - condition: Falco filter expression (sysdig filter syntax)
+#   - output:    alert message template with field substitutions
+#   - priority:  EMERGENCY|ALERT|CRITICAL|ERROR|WARNING|NOTICE|INFORMATIONAL|DEBUG
+#   - tags:      categorization labels
+# =============================================================================
+
+# --- Macros: reusable filter building blocks ---------------------------------
+
+# Trusted container images that are allowed to run privileged operations
+- macro: trusted_privileged_containers
+  condition: >
+    (container.image.repository in (
+      "calico/node",
+      "cilium/cilium",
+      "falcosecurity/falco",
+      "kindest/node"
+    ))
+
+# Containers expected to write to /etc (config management agents)
+- macro: config_management_containers
+  condition: >
+    (container.image.repository in (
+      "ansible",
+      "chef/chef",
+      "puppet/puppet-agent"
+    ))
+
+# Shell binaries that indicate interactive or script-based access
+- macro: shell_binaries
+  condition: >
+    proc.name in (bash, sh, zsh, ksh, fish, tcsh, dash, ash)
+
+# Common package managers — their use at runtime is suspicious
+- macro: package_mgmt_binaries
+  condition: >
+    proc.name in (apt, apt-get, yum, dnf, apk, pip, pip3, npm, yarn, gem, cargo)
+
+# --- Lists: reusable value sets ----------------------------------------------
+
+- list: sensitive_host_paths
+  items:
+    - /etc/shadow
+    - /etc/passwd
+    - /etc/sudoers
+    - /root/.ssh
+    - /home/.ssh
+    - /etc/kubernetes/pki
+    - /var/lib/kubelet/pki
+    - /run/secrets/kubernetes.io
+
+- list: crypto_mining_processes
+  items:
+    - xmrig, xmr-stak, minerd, cpuminer, ethminer,
+      claymore, phoenixminer, lolminer, nbminer
+
+# --- Rules -------------------------------------------------------------------
+
+# Rule 1: Detect shell spawned inside a container
+# Legitimate containers run a single process — a shell indicates breakout or debug
+- rule: Shell Spawned in Container
+  desc: >
+    A shell was spawned inside a running container. This may indicate an attacker
+    gaining interactive access or a developer exec-ing into a production pod.
+  condition: >
+    spawned_process
+    and container
+    and shell_binaries
+    and not container.image.repository in (kindest/node)
+    and not proc.pname in (runc, containerd-shim, systemd)
+  output: >
+    Shell spawned in container
+    (user=%user.name user_uid=%user.uid container=%container.name
+     image=%container.image.repository:%container.image.tag
+     shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+     pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: WARNING
+  tags: [container, shell, mitre_execution, T1059]
+
+# Rule 2: Package manager executed at runtime
+# Installing packages at runtime bypasses image scanning and is highly suspicious
+- rule: Package Management Tool Executed in Container
+  desc: >
+    A package manager (apt, yum, apk, pip, npm, etc.) ran inside a container.
+    Legitimate container workloads should not install packages at runtime.
+  condition: >
+    spawned_process
+    and container
+    and package_mgmt_binaries
+    and not config_management_containers
+  output: >
+    Package manager executed in container
+    (user=%user.name pkg_mgr=%proc.name cmdline=%proc.cmdline
+     container=%container.name image=%container.image.repository:%container.image.tag
+     pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: ERROR
+  tags: [container, package_management, mitre_persistence, T1072]
+
+# Rule 3: Write to sensitive host path from container
+# Containers should not modify host system files
+- rule: Write to Sensitive Host Path from Container
+  desc: >
+    A process inside a container wrote to a sensitive host filesystem path.
+    This may indicate a container escape or privilege escalation attempt.
+  condition: >
+    open_write
+    and container
+    and fd.name pmatch (sensitive_host_paths)
+    and not trusted_privileged_containers
+  output: >
+    Sensitive host path written from container
+    (user=%user.name file=%fd.name container=%container.name
+     image=%container.image.repository:%container.image.tag
+     proc=%proc.name cmdline=%proc.cmdline pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: CRITICAL
+  tags: [container, filesystem, mitre_privilege_escalation, T1611]
+
+# Rule 4: Crypto mining process detected
+# Mining malware is a common payload in compromised containers
+- rule: Crypto Mining Process Detected
+  desc: >
+    A known cryptocurrency mining process was detected. This strongly indicates
+    a compromised container or cluster resource abuse.
+  condition: >
+    spawned_process
+    and proc.name in (crypto_mining_processes)
+  output: >
+    Crypto mining process detected
+    (user=%user.name proc=%proc.name cmdline=%proc.cmdline
+     container=%container.name image=%container.image.repository:%container.image.tag
+     pod=%k8s.pod.name ns=%k8s.ns.name host=%host.name)
+  priority: CRITICAL
+  tags: [host, container, crypto_mining, mitre_impact, T1496]
+
+# Rule 5: Outbound connection to non-standard port from container
+# C2 (command-and-control) beaconing often uses unusual ports
+- rule: Outbound Network Connection to Suspicious Port
+  desc: >
+    A container initiated an outbound TCP connection to a port commonly used
+    by malware C2 frameworks (e.g., 4444, 1337, 31337, 8888).
+  condition: >
+    outbound
+    and container
+    and fd.sport in (4444, 1337, 31337, 8888, 9999, 6666, 6667, 6668, 6669)
+  output: >
+    Outbound connection to suspicious port
+    (user=%user.name container=%container.name
+     image=%container.image.repository:%container.image.tag
+     src=%fd.cip:%fd.cport dst=%fd.sip:%fd.sport
+     proto=%fd.l4proto pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: WARNING
+  tags: [network, container, mitre_command_and_control, T1571]
+
+# Rule 6: kubectl executed inside a pod
+# Running kubectl inside a pod indicates potential lateral movement or cluster recon
+- rule: kubectl Executed Inside Pod
+  desc: >
+    The kubectl binary was executed inside a running pod. Attackers use kubectl
+    inside compromised pods to enumerate and pivot within the cluster.
+  condition: >
+    spawned_process
+    and container
+    and proc.name = "kubectl"
+  output: >
+    kubectl executed inside pod
+    (user=%user.name cmdline=%proc.cmdline
+     container=%container.name image=%container.image.repository:%container.image.tag
+     pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: ERROR
+  tags: [container, kubernetes, mitre_discovery, T1613]
+
+# Rule 7: Container running as root UID 0
+# Informational — root containers are risky even if not yet exploited
+- rule: Container Running as Root User
+  desc: >
+    A container process is running as UID 0 (root). While not immediately an
+    attack, root containers have a much larger blast radius if compromised.
+  condition: >
+    spawned_process
+    and container
+    and user.uid = 0
+    and not trusted_privileged_containers
+    and not proc.name in (pause, runc)
+  output: >
+    Container running as root
+    (user=%user.name uid=%user.uid container=%container.name
+     image=%container.image.repository:%container.image.tag
+     proc=%proc.name pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: NOTICE
+  tags: [container, privilege, mitre_privilege_escalation, T1610]
+
+# Rule 8: Modification of /etc/hosts or /etc/resolv.conf at runtime
+# DNS hijacking technique — attacker redirects DNS resolution inside container
+- rule: DNS Configuration File Modified at Runtime
+  desc: >
+    /etc/hosts or /etc/resolv.conf was modified at runtime inside a container.
+    This may indicate DNS hijacking or persistence mechanism installation.
+  condition: >
+    open_write
+    and container
+    and fd.name in (/etc/hosts, /etc/resolv.conf, /etc/hostname)
+  output: >
+    DNS config file modified in container
+    (user=%user.name file=%fd.name proc=%proc.name cmdline=%proc.cmdline
+     container=%container.name image=%container.image.repository:%container.image.tag
+     pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: WARNING
+  tags: [container, network, mitre_defense_evasion, T1565]
