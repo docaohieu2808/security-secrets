@@ -121,7 +121,7 @@ metadata:
 type: Opaque
 stringData:
   database_url: "postgresql://user:${DB_PASSWORD}@postgres:5432/myapp"
-  api_key: "sk_live_abcdef1234567890"
+  api_key: "sk_test_abcdef1234567890"
   jwt_secret: "my-super-secret-jwt-signing-key-32chars"
   redis_password: "${REDIS_PASSWORD}"
   smtp_password: "${SMTP_PASSWORD}"
