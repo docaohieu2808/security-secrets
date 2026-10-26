@@ -15,6 +15,9 @@
 # Env (all optional except the first two):
 #   SONAR_HOST_URL, SONAR_TOKEN
 #   SONAR_PROJECT_KEY, SONAR_PROJECT_NAME, SONAR_SOURCES   defaults for the three arguments
+#   SONAR_PROJECT_VERSION   sets sonar.projectVersion. The default "new code" definition is "since the previous
+#                     version", so a gate on new code only has something to judge from the SECOND analysis with a
+#                     different version on (the first analysis of a project has no baseline and passes trivially).
 #   COVERAGE_REPORT   path to a coverage report (relative to the repo root)
 #   COVERAGE_FORMAT   generic (default for .xml) | jacoco | python | lcov (default for .info/.lcov)
 #   SCANNER_DOCKER_NETWORK   docker network for the containerised scanner (default host, so localhost works)
@@ -85,6 +88,9 @@ build_scanner_args() {
     "-Dsonar.qualitygate.timeout=${QG_TIMEOUT}"
     "-Dsonar.scm.disabled=true"
   )
+  if [[ -n "${SONAR_PROJECT_VERSION:-}" ]]; then
+    SCANNER_ARGS+=("-Dsonar.projectVersion=${SONAR_PROJECT_VERSION}")
+  fi
 
   if [[ -n "${PR_KEY:-}" ]]; then
     SCANNER_ARGS+=(

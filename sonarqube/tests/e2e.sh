@@ -24,31 +24,32 @@ conditions="$(curl -sf -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/
 [[ "${conditions}" == "9" ]] || fail "gate has ${conditions} conditions, expected 9"
 pass "quality gate imported: 9 conditions, set as default"
 
-echo "== clean project must pass =="
-( cd "${HERE}/fixtures/clean" && COVERAGE_REPORT=coverage.xml "${HERE}/l3-scanner-ci-integration.sh" clean-app "Clean App" src )
-status="$(curl -sf -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=clean-app" | jq -r '.projectStatus.status')"
-[[ "${status}" == "OK" ]] || fail "clean-app gate is ${status}"
-pass "clean-app: scanner exited 0, gate OK"
-
-echo "== project with deliberate problems must fail =="
-rc=0
-( cd "${HERE}/fixtures/bad" && "${HERE}/l3-scanner-ci-integration.sh" bad-app "Bad App" src ) || rc=$?
-# informational only: what SonarQube thinks of bad-app, for the log
-diag() { # <description> <api path with query> <jq filter>
-  local out
-  if out="$(curl -sf -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}$2" | jq -r "$3")"; then
-    printf '   %s\n%s\n' "$1" "${out}"
-  else
-    printf '   %s: request failed\n' "$1"
-  fi
+# A gate on NEW code needs a baseline: the first analysis of a project has none and passes trivially (its project
+# status has no conditions at all). So each project is scanned twice, version 1.0 = baseline, 1.1 = the change.
+scan() { # <project-key> <name> <version> <dir-with-src> [coverage-file]
+  ( cd "$4" && SONAR_PROJECT_VERSION="$3" COVERAGE_REPORT="${5:-}" "${HERE}/l3-scanner-ci-integration.sh" "$1" "$2" src )
 }
-diag "issues" "/api/issues/search?componentKeys=bad-app&ps=50" '.issues[] | "     \(.rule) \(.severity) \(.type)"'
-diag "hotspots" "/api/hotspots/search?projectKey=bad-app" '.hotspots[] | "     \(.ruleKey) \(.status)"'
-diag "measures" "/api/measures/component?component=bad-app&metricKeys=new_violations,new_security_hotspots,new_security_hotspots_reviewed,new_coverage,new_security_rating,new_software_quality_security_rating" '.component.measures | tostring'
-diag "gate" "/api/qualitygates/project_status?projectKey=bad-app" '.projectStatus | tostring'
+status_of() { curl -sf -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=$1"; }
+
+echo "== baseline scans (version 1.0): nothing to judge yet =="
+for key in clean-app bad-app; do
+  scan "${key}" "${key}" 1.0 "${HERE}/fixtures/baseline" coverage.xml
+done
+pass "both projects have a 1.0 baseline"
+
+echo "== clean change (version 1.1) must pass, with the gate actually evaluating conditions =="
+scan clean-app clean-app 1.1 "${HERE}/fixtures/clean-change" coverage.xml
+status="$(status_of clean-app)"
+[[ "$(jq -r '.projectStatus.status' <<<"${status}")" == "OK" ]] || fail "clean-app gate: $(jq -c '.projectStatus' <<<"${status}")"
+[[ "$(jq '.projectStatus.conditions | length' <<<"${status}")" -ge 1 ]] || fail "clean-app: the gate evaluated no conditions"
+pass "clean-app 1.1: scanner exited 0, gate OK with $(jq '.projectStatus.conditions | length' <<<"${status}") conditions evaluated"
+
+echo "== change with deliberate problems (version 1.1) must fail =="
+rc=0
+scan bad-app bad-app 1.1 "${HERE}/fixtures/bad-change" || rc=$?
+status="$(status_of bad-app)"
+printf '   gate: %s\n' "$(jq -c '.projectStatus' <<<"${status}")"
 [[ ${rc} -ne 0 ]] || fail "bad-app passed the gate"
-status="$(curl -sf -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=bad-app" | jq -r '.projectStatus.status')"
-[[ "${status}" == "ERROR" ]] || fail "bad-app gate is ${status}, expected ERROR"
-pass "bad-app: scanner exited ${rc}, gate ERROR"
-curl -sf -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=bad-app" \
-  | jq -r '.projectStatus.conditions[] | select(.status=="ERROR") | "     failed condition: \(.metricKey)"'
+[[ "$(jq -r '.projectStatus.status' <<<"${status}")" == "ERROR" ]] || fail "bad-app gate is not ERROR"
+pass "bad-app 1.1: scanner exited ${rc}, gate ERROR"
+jq -r '.projectStatus.conditions[] | select(.status=="ERROR") | "     failed condition: \(.metricKey)"' <<<"${status}"

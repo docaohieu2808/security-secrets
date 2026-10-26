@@ -1,4 +1,4 @@
-"""Module with deliberate problems so the quality gate has something to fail on."""
+"""The change to a project that goes wrong: deliberate problems so the quality gate has something to fail on."""
 import hashlib
 
 DB_PASSWORD = "Sup3rS3cret!Passw0rd"   # hard-coded credential

@@ -1,0 +1,9 @@
+<coverage version="1">
+  <file path="src/app.py">
+    <lineToCover lineNumber="5" covered="true"/>
+    <lineToCover lineNumber="10" covered="true"/>
+  </file>
+  <file path="src/extra.py">
+    <lineToCover lineNumber="5" covered="true"/>
+  </file>
+</coverage>
