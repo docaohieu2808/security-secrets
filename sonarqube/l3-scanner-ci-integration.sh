@@ -50,8 +50,9 @@ choose_scanner() {
   elif command -v docker >/dev/null; then
     log "sonar-scanner not installed, using ${SCANNER_IMAGE}"
     # -e NAME (no value) forwards the variable without putting the secret in the command line.
+    # -w makes /usr/src the project base dir (as a non-root user the image would otherwise start in /tmp)
     SCANNER_CMD=(docker run --rm --network "${SCANNER_DOCKER_NETWORK:-host}"
-      -u "$(id -u):$(id -g)" -e SONAR_USER_HOME=/tmp/.sonar
+      -u "$(id -u):$(id -g)" -w /usr/src -e SONAR_USER_HOME=/tmp/.sonar
       -e SONAR_HOST_URL -e SONAR_TOKEN
       -v "$(pwd):/usr/src" "${SCANNER_IMAGE}")
   else
