@@ -1,102 +1,54 @@
 #!/usr/bin/env bash
 # =============================================================================
-# l1-container-scan.sh — Trivy Level 1: Scan Docker images for vulnerabilities
+# l1 - Trivy: scan a container image for vulnerabilities, secrets and image misconfiguration
 #
-# Usage:
-#   ./l1-container-scan.sh <image:tag> [severity] [output-format]
+#   ./l1-container-scan.sh <image:tag> [severity] [format]
+#   ./l1-container-scan.sh python:3.12-alpine
+#   ./l1-container-scan.sh myapp:1.4.0 HIGH,CRITICAL json
 #
-# Examples:
-#   ./l1-container-scan.sh nginx:latest
-#   ./l1-container-scan.sh myapp:1.0.0 HIGH,CRITICAL json
-#   ./l1-container-scan.sh alpine:3.18 CRITICAL table
+# Exit status: 0 = nothing at/above SEVERITY, 1 = findings (the CI gate), anything else = the scan itself failed.
+# The scan runs once and writes a JSON report; a table is rendered from that report with `trivy convert`, so the
+# numbers on screen and in the file always agree.
 #
-# Prerequisites:
-#   - trivy installed (https://aquasecurity.github.io/trivy)
-#     Install: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-#   - Docker running (for pulling images)
+# Install a pinned trivy first: ./install-trivy.sh   (never pipe a script from a moving branch into sh)
+# Env: IGNORE_UNFIXED=true|false (default true: hide vulnerabilities that have no fixed version yet)
+#      REPORT_DIR (default ./trivy-reports)
 # =============================================================================
 set -euo pipefail
 
-# --- Configuration -----------------------------------------------------------
-IMAGE="${1:-nginx:latest}"
-SEVERITY="${2:-HIGH,CRITICAL}"        # UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
-OUTPUT_FORMAT="${3:-table}"           # table, json, sarif, cyclonedx, template
-REPORT_DIR="./trivy-reports"
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-REPORT_FILE="${REPORT_DIR}/container-scan-${TIMESTAMP}.${OUTPUT_FORMAT}"
+IMAGE="${1:?usage: $0 <image:tag> [severity] [format]}"
+SEVERITY="${2:-HIGH,CRITICAL}"           # UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+FORMAT="${3:-json}"                      # json, sarif, cyclonedx, ... (anything `trivy image --format` accepts)
+IGNORE_UNFIXED="${IGNORE_UNFIXED:-true}"
+REPORT_DIR="${REPORT_DIR:-./trivy-reports}"
+REPORT_FILE="${REPORT_DIR}/container-scan-$(date +%Y%m%d-%H%M%S).${FORMAT}"
 
-# Exit codes
-EXIT_CODE_ON_VULN=1   # Set to 0 to never fail on findings (useful in dev)
+log()  { printf '[INFO]  %s\n' "$*"; }
+warn() { printf '[WARN]  %s\n' "$*" >&2; }
+die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-# --- Helpers -----------------------------------------------------------------
-log()  { echo "[INFO]  $*"; }
-warn() { echo "[WARN]  $*" >&2; }
-die()  { echo "[ERROR] $*" >&2; exit 1; }
+command -v trivy >/dev/null || die "trivy not found; run ./install-trivy.sh"
+mkdir -p "${REPORT_DIR}"
 
-check_dependencies() {
-    command -v trivy &>/dev/null || die "trivy not found. Install: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin"
-    command -v docker &>/dev/null || warn "docker not found — image must be pullable from registry cache"
-}
+args=(image --severity "${SEVERITY}" --scanners "vuln,secret,misconfig" --format "${FORMAT}" --output "${REPORT_FILE}"
+      --exit-code 1 --timeout 10m)
+[[ "${IGNORE_UNFIXED}" == "true" ]] && args+=(--ignore-unfixed)
 
-print_banner() {
-    echo "=============================================="
-    echo " Trivy Container Image Vulnerability Scanner"
-    echo "=============================================="
-    echo " Image    : ${IMAGE}"
-    echo " Severity : ${SEVERITY}"
-    echo " Format   : ${OUTPUT_FORMAT}"
-    echo " Report   : ${REPORT_FILE}"
-    echo "=============================================="
-}
+log "scanning ${IMAGE} (severity ${SEVERITY}, unfixed ignored: ${IGNORE_UNFIXED})"
 
-# --- Main --------------------------------------------------------------------
-main() {
-    check_dependencies
-    print_banner
+# `set -e` would end the script at the first non-zero exit, which is exactly the "findings" case we want to
+# report on. Capture the code instead.
+rc=0
+trivy "${args[@]}" "${IMAGE}" || rc=$?
 
-    mkdir -p "${REPORT_DIR}"
+case "${rc}" in
+  0) log "no ${SEVERITY} findings" ;;
+  1) warn "${SEVERITY} findings in ${IMAGE}" ;;
+  *) die "trivy failed with exit ${rc}" ;;
+esac
 
-    log "Updating Trivy vulnerability database..."
-    trivy image --download-db-only --quiet
-
-    log "Scanning image: ${IMAGE}"
-
-    # Full vulnerability scan of the container image
-    # --scanners: vuln = CVE scan, secret = embedded secrets, misconfig = Dockerfile issues
-    # --ignore-unfixed: skip vulns with no patch yet (reduce noise)
-    # --exit-code: return non-zero if vulns found at given severity
-    trivy image \
-        --severity "${SEVERITY}" \
-        --scanners vuln,secret,misconfig \
-        --format "${OUTPUT_FORMAT}" \
-        --output "${REPORT_FILE}" \
-        --exit-code "${EXIT_CODE_ON_VULN}" \
-        --ignore-unfixed \
-        --timeout 10m \
-        "${IMAGE}"
-
-    local exit_status=$?
-
-    if [[ $exit_status -eq 0 ]]; then
-        log "Scan complete — no ${SEVERITY} vulnerabilities found."
-    else
-        warn "Scan complete — vulnerabilities found! Review: ${REPORT_FILE}"
-    fi
-
-    # Also print summary to stdout regardless of format
-    if [[ "${OUTPUT_FORMAT}" != "table" ]]; then
-        log "Printing table summary to stdout..."
-        trivy image \
-            --severity "${SEVERITY}" \
-            --scanners vuln,secret \
-            --format table \
-            --ignore-unfixed \
-            --quiet \
-            "${IMAGE}" || true
-    fi
-
-    log "Full report saved to: ${REPORT_FILE}"
-    return $exit_status
-}
-
-main "$@"
+if [[ "${FORMAT}" == "json" ]]; then
+  trivy convert --format table --severity "${SEVERITY}" "${REPORT_FILE}"
+fi
+log "report: ${REPORT_FILE}"
+exit "${rc}"

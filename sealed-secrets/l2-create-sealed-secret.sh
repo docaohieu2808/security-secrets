@@ -1,259 +1,168 @@
 #!/usr/bin/env bash
 # =============================================================================
-# l2-create-sealed-secret.sh — Sealed Secrets: Create SealedSecret from K8s Secret
+# l2 - Sealed Secrets: seal, apply, verify, scope, re-encrypt
 #
-# Workflow:
-#   1. Create a plain K8s Secret manifest (never commit this)
-#   2. Use kubeseal to encrypt it into a SealedSecret (safe to commit)
-#   3. Apply SealedSecret to cluster via kubectl or GitOps
-#   4. Controller decrypts and creates the native K8s Secret in-cluster
+# Workflow
+#   1. Create a plain Secret manifest (never commit it)
+#   2. kubeseal encrypts it into a SealedSecret (safe to commit)
+#   3. kubectl/GitOps applies the SealedSecret, the controller creates the Secret
 #
-# Scopes:
-#   strict       — bound to specific name + namespace (most secure, default)
-#   namespace-wide — bound to namespace only (name can change)
-#   cluster-wide — not bound to name or namespace (use sparingly)
+# Scopes (what the ciphertext is bound to):
+#   strict          name + namespace (default, safest)
+#   namespace-wide  namespace only (the Secret may be renamed)
+#   cluster-wide    nothing (can move anywhere; use sparingly)
 #
-# Usage:
-#   ./l2-create-sealed-secret.sh
+# Usage:  ./l2-create-sealed-secret.sh            (needs kubectl, kubeseal, openssl, a controller from l1)
+# Env:    NAMESPACE (default sealed-demo), OUTPUT_DIR (default ./sealed-output), DB_PASSWORD (default: random)
 #
-# Prerequisites:
-#   - kubeseal CLI (see l1-install-controller.yaml for install instructions)
-#   - kubectl configured with cluster access
-#   - Sealed Secrets controller running in cluster
+# Secret values never go on a command line (`ps` would show them): they are written to a mode-600
+# env file / piped through stdin instead.
 # =============================================================================
 set -euo pipefail
 
-NAMESPACE="${NAMESPACE:-myapp}"
-OUTPUT_DIR="./sealed-output"
+NAMESPACE="${NAMESPACE:-sealed-demo}"
+OUTPUT_DIR="${OUTPUT_DIR:-./sealed-output}"
+CERT="${OUTPUT_DIR}/sealed-secrets-public-key.pem"
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+umask 077
 
-log()  { echo; echo "==> $*"; }
-cmd()  { echo "    \$ $*"; eval "$@"; }
-die()  { echo "[ERROR] $*" >&2; exit 1; }
+log()  { printf '\n==> %s\n' "$*"; }
+info() { printf '    [INFO] %s\n' "$*"; }
+die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+# Print the command, then run it. "$@" (not eval) keeps quoting intact.
+run()  { printf '    $ %s\n' "$*"; "$@"; }
 
-check_dependencies() {
-    command -v kubeseal &>/dev/null || die "kubeseal not found. See l1-install-controller.yaml for install instructions."
-    command -v kubectl  &>/dev/null || die "kubectl not found."
-}
-
+for tool in kubectl kubeseal openssl; do
+  command -v "${tool}" >/dev/null || die "${tool} not found (kubeseal: see l1-install-controller.yaml)"
+done
 mkdir -p "${OUTPUT_DIR}"
 
-# =============================================================================
-# 1. Fetch controller's public key (cache locally for offline sealing)
-# =============================================================================
+# Wait for the controller to report the SealedSecret as decrypted (status condition Synced).
+wait_synced() { # <name>
+  kubectl -n "${NAMESPACE}" wait --for=condition=Synced "sealedsecret/$1" --timeout=60s
+}
+
+# 1. Public certificate. Fetching it once lets people seal offline; the cert is public, commit it if you like.
 fetch_public_key() {
-    log "Step 1: Fetch controller public key"
-
-    local pub_key="${OUTPUT_DIR}/sealed-secrets-public-key.pem"
-
-    if [[ -f "${pub_key}" ]]; then
-        info "Using cached public key: ${pub_key}"
-        info "To refresh: rm ${pub_key} && run this script again"
-    else
-        cmd "kubeseal --fetch-cert \
-            --controller-name=sealed-secrets \
-            --controller-namespace=kube-system \
-            > ${pub_key}"
-        echo "    Public key saved to: ${pub_key}"
-    fi
-
-    export SEALED_SECRETS_CERT="${OUTPUT_DIR}/sealed-secrets-public-key.pem"
+  log "Step 1: fetch the controller's public certificate"
+  # kubeseal defaults: controller sealed-secrets-controller in kube-system (l1 sets fullnameOverride to match)
+  run kubeseal --fetch-cert > "${CERT}"
+  info "saved ${CERT}"
 }
 
-info() { echo "    [INFO] $*"; }
-
-# =============================================================================
-# 2. Example: Seal a database credentials Secret (strict scope)
-# =============================================================================
+# 2. Strict scope: a database credentials Secret.
 seal_database_credentials() {
-    log "Step 2: Seal database credentials (strict scope)"
-
-    local plaintext="${OUTPUT_DIR}/db-secret-plaintext.yaml"
-    local sealed="${OUTPUT_DIR}/db-secret-sealed.yaml"
-
-    # Create the plaintext secret manifest
-    kubectl create secret generic myapp-db-credentials \
-        --namespace="${NAMESPACE}" \
-        --from-literal=username=myapp_user \
-        --from-literal=password=${DB_PASSWORD} \
-        --from-literal=host=postgres.internal \
-        --from-literal=port=5432 \
-        --dry-run=client \
-        --output=yaml > "${plaintext}"
-
-    echo "    Plaintext secret: ${plaintext} (DO NOT commit)"
-
-    # Seal with strict scope (bound to name=myapp-db-credentials, ns=myapp)
-    cmd "kubeseal \
-        --cert=${SEALED_SECRETS_CERT} \
-        --scope=strict \
-        --format=yaml \
-        < ${plaintext} > ${sealed}"
-
-    echo "    SealedSecret: ${sealed} (SAFE to commit)"
-    echo ""
-    echo "    Preview:"
-    head -20 "${sealed}"
+  log "Step 2: seal database credentials (strict scope)"
+  local pw="${DB_PASSWORD:-$(openssl rand -base64 18)}"
+  printf 'username=myapp_user\npassword=%s\nhost=postgres.internal\nport=5432\n' "${pw}" > "${WORK}/db.env"
+  kubectl create secret generic myapp-db-credentials --namespace "${NAMESPACE}" \
+    --from-env-file="${WORK}/db.env" --dry-run=client -o yaml > "${WORK}/db-plaintext.yaml"
+  run kubeseal --cert "${CERT}" --scope strict --format yaml \
+    < "${WORK}/db-plaintext.yaml" > "${OUTPUT_DIR}/db-secret-sealed.yaml"
+  info "SealedSecret (safe to commit): ${OUTPUT_DIR}/db-secret-sealed.yaml"
 }
 
-# =============================================================================
-# 3. Example: Seal TLS certificate Secret
-# =============================================================================
+# 3. A real kubernetes.io/tls Secret from a throwaway self-signed certificate.
 seal_tls_secret() {
-    log "Step 3: Seal TLS certificate Secret"
-
-    local plaintext="${OUTPUT_DIR}/tls-secret-plaintext.yaml"
-    local sealed="${OUTPUT_DIR}/tls-secret-sealed.yaml"
-
-    # Create from certificate files (replace with real cert paths)
-    # Using placeholder data for demo — replace /dev/stdin with real files
-    kubectl create secret tls myapp-tls \
-        --namespace="${NAMESPACE}" \
-        --cert=<(echo "-----BEGIN CERTIFICATE-----\nPLACEHOLDER\n-----END CERTIFICATE-----") \
-        --key=<(echo "-----BEGIN PRIVATE KEY-----\nPLACEHOLDER\n-----END PRIVATE KEY-----") \
-        --dry-run=client \
-        --output=yaml > "${plaintext}" 2>/dev/null || \
-    kubectl create secret generic myapp-tls \
-        --namespace="${NAMESPACE}" \
-        --from-literal=tls.crt="CERT_PLACEHOLDER" \
-        --from-literal=tls.key="KEY_PLACEHOLDER" \
-        --dry-run=client \
-        --output=yaml > "${plaintext}"
-
-    cmd "kubeseal \
-        --cert=${SEALED_SECRETS_CERT} \
-        --scope=strict \
-        --format=yaml \
-        < ${plaintext} > ${sealed}"
-
-    echo "    SealedSecret saved: ${sealed}"
+  log "Step 3: seal a TLS Secret"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=myapp.example.internal" \
+    -keyout "${WORK}/tls.key" -out "${WORK}/tls.crt" 2>/dev/null
+  kubectl create secret tls myapp-tls --namespace "${NAMESPACE}" \
+    --cert "${WORK}/tls.crt" --key "${WORK}/tls.key" --dry-run=client -o yaml > "${WORK}/tls-plaintext.yaml"
+  run kubeseal --cert "${CERT}" --scope strict --format yaml \
+    < "${WORK}/tls-plaintext.yaml" > "${OUTPUT_DIR}/tls-secret-sealed.yaml"
 }
 
-# =============================================================================
-# 4. Example: Seal with namespace-wide scope (reusable across secret names)
-# =============================================================================
+# 4. namespace-wide scope: the sealed object may be renamed without re-sealing.
 seal_namespace_wide() {
-    log "Step 4: Seal with namespace-wide scope"
-
-    local plaintext="${OUTPUT_DIR}/api-keys-plaintext.yaml"
-    local sealed="${OUTPUT_DIR}/api-keys-sealed.yaml"
-
-    kubectl create secret generic myapp-api-keys \
-        --namespace="${NAMESPACE}" \
-        --from-literal=stripe_key=sk_live_xxxxxxxxxxxx \
-        --from-literal=sendgrid_key=SG.xxxxxxxxxx \
-        --dry-run=client \
-        --output=yaml > "${plaintext}"
-
-    # namespace-wide: can be renamed without re-sealing
-    # Useful for Helm charts that parametrize secret names
-    cmd "kubeseal \
-        --cert=${SEALED_SECRETS_CERT} \
-        --scope=namespace-wide \
-        --format=yaml \
-        < ${plaintext} > ${sealed}"
-
-    echo "    SealedSecret (namespace-wide): ${sealed}"
+  log "Step 4: seal with namespace-wide scope"
+  printf 'api_key=example-not-a-real-key\n' > "${WORK}/api.env"
+  kubectl create secret generic myapp-api-keys --namespace "${NAMESPACE}" \
+    --from-env-file="${WORK}/api.env" --dry-run=client -o yaml > "${WORK}/api-plaintext.yaml"
+  run kubeseal --cert "${CERT}" --scope namespace-wide --format yaml \
+    < "${WORK}/api-plaintext.yaml" > "${OUTPUT_DIR}/api-keys-sealed.yaml"
 }
 
-# =============================================================================
-# 5. Apply SealedSecret to cluster
-# =============================================================================
+# 5. Apply and wait for the controller.
 apply_sealed_secrets() {
-    log "Step 5: Apply SealedSecrets to cluster"
-
-    cmd "kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -"
-
-    for sealed_file in "${OUTPUT_DIR}"/*-sealed.yaml; do
-        info "Applying: ${sealed_file}"
-        cmd "kubectl apply -f ${sealed_file}"
-    done
-
-    echo ""
-    info "Waiting for controller to decrypt and create Secrets..."
-    sleep 3
-
-    cmd "kubectl get secrets -n ${NAMESPACE}"
-    cmd "kubectl get sealedsecrets -n ${NAMESPACE}"
+  log "Step 5: apply the SealedSecrets and wait for decryption"
+  kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+  local f
+  for f in "${OUTPUT_DIR}"/*-sealed.yaml; do run kubectl apply -f "${f}"; done
+  wait_synced myapp-db-credentials
+  wait_synced myapp-tls
+  wait_synced myapp-api-keys
+  run kubectl -n "${NAMESPACE}" get sealedsecrets,secrets
 }
 
-# =============================================================================
-# 6. Verify decrypted Secret
-# =============================================================================
+# 6. The decrypted Secret really exists (do not print values in real life).
 verify_secret() {
-    log "Step 6: Verify decrypted Secret exists in cluster"
-
-    cmd "kubectl get secret myapp-db-credentials -n ${NAMESPACE} -o yaml" || \
-        info "Secret not yet created — controller may still be processing"
-
-    # Decode a value to verify
-    local db_user
-    db_user=$(kubectl get secret myapp-db-credentials \
-        -n "${NAMESPACE}" \
-        -o jsonpath='{.data.username}' 2>/dev/null | base64 -d || echo "not found")
-    info "Decoded username: ${db_user}"
+  log "Step 6: verify the controller created the Secret"
+  local user
+  user="$(kubectl -n "${NAMESPACE}" get secret myapp-db-credentials -o jsonpath='{.data.username}' | base64 -d)"
+  [[ "${user}" == "myapp_user" ]] || die "decrypted username is '${user}', expected myapp_user"
+  local type
+  type="$(kubectl -n "${NAMESPACE}" get secret myapp-tls -o jsonpath='{.type}')"
+  [[ "${type}" == "kubernetes.io/tls" ]] || die "myapp-tls has type ${type}"
+  info "username and TLS secret type are correct"
 }
 
-# =============================================================================
-# 7. Key rotation — re-seal after controller key rotation
-# =============================================================================
-show_rotation_workflow() {
-    log "Step 7: Key rotation workflow"
-
-    echo "    After controller rotates its sealing key:"
-    echo ""
-    echo "    1. Fetch new public key:"
-    echo "       kubeseal --fetch-cert --controller-namespace=kube-system > new-key.pem"
-    echo ""
-    echo "    2. Re-seal all SealedSecrets with new key:"
-    echo "       for f in \$(find ./k8s -name '*-sealed.yaml'); do"
-    echo "         # Decrypt from cluster, re-seal with new key"
-    echo "         kubectl get secret \$(yq .spec.template.metadata.name \$f) \\"
-    echo "           -n \$(yq .metadata.namespace \$f) -o yaml \\"
-    echo "           | kubeseal --cert new-key.pem -o yaml > \$f"
-    echo "       done"
-    echo ""
-    echo "    3. Commit and push updated SealedSecrets to Git"
-    echo ""
-    echo "    Note: Old sealing keys are retained by the controller,"
-    echo "    so existing SealedSecrets continue to work until re-sealed."
+# 7. Scope in action: rename the sealed object.
+#    strict         -> the controller refuses (the name is part of the encryption label)
+#    namespace-wide -> still decrypts, because only the namespace is bound
+demonstrate_scope() {
+  log "Step 7: scope demo - rename both sealed objects"
+  # First 2-space-indented `name:` is metadata.name (spec.template.metadata.name is indented deeper).
+  sed -E '0,/^  name: .*/s//  name: renamed-api-keys/' "${OUTPUT_DIR}/api-keys-sealed.yaml" > "${WORK}/renamed-ns-wide.yaml"
+  sed -E '0,/^  name: .*/s//  name: renamed-db-credentials/' "${OUTPUT_DIR}/db-secret-sealed.yaml" > "${WORK}/renamed-strict.yaml"
+  kubectl apply -f "${WORK}/renamed-ns-wide.yaml"
+  wait_synced renamed-api-keys
+  info "namespace-wide: renamed SealedSecret decrypted"
+  kubectl apply -f "${WORK}/renamed-strict.yaml"
+  sleep 5
+  local synced
+  synced="$(kubectl -n "${NAMESPACE}" get sealedsecret renamed-db-credentials -o jsonpath='{.status.conditions[?(@.type=="Synced")].status}')"
+  [[ "${synced}" != "True" ]] || die "strict-scope SealedSecret was decrypted after a rename; it must not be"
+  info "strict: renamed SealedSecret was rejected (Synced=${synced:-unset})"
+  kubectl -n "${NAMESPACE}" delete sealedsecret renamed-db-credentials >/dev/null
 }
 
-# =============================================================================
-# 8. Update .gitignore
-# =============================================================================
-update_gitignore() {
-    log "Step 8: Ensure plaintext secrets are gitignored"
-
-    local gitignore="../.gitignore"
-    if ! grep -q "plaintext" "${gitignore}" 2>/dev/null; then
-        cat >> "${gitignore}" <<'EOF'
-
-# Sealed Secrets: plaintext manifests (sealed *-sealed.yaml ARE safe to commit)
-*-plaintext.yaml
-*-plain.yaml
-*.plaintext.yaml
-EOF
-        info "Updated .gitignore"
-    fi
+# 8. Re-encrypt: move existing SealedSecrets to the newest sealing key without ever seeing the plaintext.
+reencrypt() {
+  log "Step 8: re-encrypt with the latest sealing key"
+  run kubeseal --re-encrypt --format yaml < "${OUTPUT_DIR}/db-secret-sealed.yaml" > "${WORK}/db-reencrypted.yaml"
+  mv "${WORK}/db-reencrypted.yaml" "${OUTPUT_DIR}/db-secret-sealed.yaml"
+  kubectl apply -f "${OUTPUT_DIR}/db-secret-sealed.yaml"
+  wait_synced myapp-db-credentials
 }
 
-# --- Main --------------------------------------------------------------------
+show_rotation_and_backup() {
+  log "Rotation and backup notes"
+  cat <<'NOTES'
+    The controller makes a new sealing key every keyrenewperiod (default 30 days) and keeps the old ones,
+    so nothing breaks on rotation. To move Git-stored SealedSecrets onto the newest key:
+        kubeseal --re-encrypt < old-sealed.yaml > new-sealed.yaml     # server-side; plaintext never leaves the controller
+    To force a new key now, set keycutofftime (chart value) or delete the active key Secret and restart the pod.
+    BACK UP THE PRIVATE KEYS or a cluster rebuild loses every SealedSecret:
+        kubectl -n kube-system get secret -l sealedsecrets.bitnami.com/sealed-secrets-key -o yaml > sealing-keys.backup.yaml
+        # store it encrypted (SOPS/age, see ../sops); restore by applying it and restarting the controller
+    Offline check of one SealedSecret (needs the private key backup):
+        kubeseal --recovery-unseal --recovery-private-key sealing-keys.backup.yaml < sealed.yaml
+NOTES
+}
+
 main() {
-    check_dependencies
-    fetch_public_key
-    seal_database_credentials
-    seal_tls_secret
-    seal_namespace_wide
-    apply_sealed_secrets
-    verify_secret
-    show_rotation_workflow
-    update_gitignore
-
-    echo ""
-    echo "=== Sealed Secrets demo complete ==="
-    echo "    Output dir: ${OUTPUT_DIR}"
-    echo "    Commit:     ${OUTPUT_DIR}/*-sealed.yaml"
-    echo "    DO NOT commit: ${OUTPUT_DIR}/*-plaintext.yaml"
+  fetch_public_key
+  seal_database_credentials
+  seal_tls_secret
+  seal_namespace_wide
+  apply_sealed_secrets
+  verify_secret
+  demonstrate_scope
+  reencrypt
+  show_rotation_and_backup
+  printf '\n=== Sealed Secrets demo complete ===\n    commit: %s/*-sealed.yaml (and the public cert)\n    never commit plaintext manifests or key backups\n' "${OUTPUT_DIR}"
 }
 
 main "$@"

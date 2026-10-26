@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: shop
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/version: "1.0"
+    app.kubernetes.io/managed-by: helm
+spec:
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec: {containers: [{name: web, image: "ghcr.io/my-org/web:1.0"}]}

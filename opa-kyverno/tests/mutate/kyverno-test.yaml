@@ -1,0 +1,15 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: mutating-policy
+policies:
+  - ../../l2-kyverno-validating-and-mutating-policies.yaml
+resources:
+  - resource.yaml
+results:
+  - policy: add-managed-by-label-if-missing
+    isMutatingPolicy: true
+    kind: Deployment
+    resources: [no-label]
+    patchedResources: patched.yaml
+    result: pass

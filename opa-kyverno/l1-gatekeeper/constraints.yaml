@@ -1,0 +1,74 @@
+# Constraints: instances of the templates in templates.yaml.
+# enforcementAction: deny | warn | dryrun  (start with warn/dryrun on a live cluster, then deny).
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: require-app-labels-on-workloads
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+    excludedNamespaces: [kube-system, kube-public, kube-node-lease, gatekeeper-system, cert-manager]
+  parameters:
+    labels:
+      - app.kubernetes.io/name
+      - app.kubernetes.io/version
+      - app.kubernetes.io/managed-by
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: require-team-label-on-namespaces
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Namespace"]
+    excludedNamespaces: [kube-system, kube-public, kube-node-lease, default, gatekeeper-system]
+  parameters:
+    labels: [team, environment]
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDenyPrivilegedContainers
+metadata:
+  name: deny-privileged-containers
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: [kube-system, gatekeeper-system, falco]   # Falco's driver needs privileges
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequireResourceLimits
+metadata:
+  name: require-resource-limits
+spec:
+  enforcementAction: warn      # switch to deny once teams have remediated
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: [kube-system, gatekeeper-system]
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAllowedRegistries
+metadata:
+  name: restrict-images-to-approved-registries
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: [kube-system, gatekeeper-system]
+  parameters:
+    registries:
+      - ghcr.io/my-org/
+      - registry.company.com/
+      - public.ecr.aws/amazonlinux/

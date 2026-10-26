@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Pod
+metadata: {name: badreg, namespace: shop}
+spec:
+  containers:
+    - name: app
+      image: docker.io/library/nginx:1.27

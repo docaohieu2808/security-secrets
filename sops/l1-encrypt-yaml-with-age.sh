@@ -1,118 +1,81 @@
 #!/usr/bin/env bash
 # =============================================================================
-# l1-encrypt-yaml-with-age.sh — SOPS: Encrypt YAML secrets using age key
+# l1 - SOPS + age: encrypt a Kubernetes Secret so it can live in Git
 #
-# SOPS (Secrets OPerationS) encrypts only the VALUES in YAML/JSON files,
-# leaving keys in plaintext — diffs remain readable in Git.
+# SOPS encrypts the VALUES of YAML/JSON and leaves the keys readable, so a diff still shows which field
+# changed. age is the small modern encryption tool that replaces GPG for this job.
 #
-# age is a simple, modern encryption tool (replaces GPG for most use cases).
+#   1. age-keygen makes a keypair (private key stays with you / your CI, public key goes in .sops.yaml)
+#   2. .sops.yaml says which recipients and which fields to encrypt
+#   3. sops encrypt   -> file that is safe to commit
+#   4. sops decrypt   -> needs the private key
 #
-# Workflow:
-#   1. Generate age keypair (once per operator/CI system)
-#   2. Configure SOPS to use the age public key via .sops.yaml
-#   3. Encrypt secrets file with: sops --encrypt
-#   4. Commit encrypted file to Git (safe)
-#   5. Decrypt at deploy time with: sops --decrypt (requires private key)
-#
-# Usage:
-#   ./l1-encrypt-yaml-with-age.sh
-#
-# Prerequisites:
-#   - age:  apt install age  OR  brew install age
-#   - sops: apt install sops OR  brew install sops OR
-#           https://github.com/getsops/sops/releases
+# Usage:  ./l1-encrypt-yaml-with-age.sh
+# Env:    WORKDIR           scratch directory for the demo files (default ./sops-demo)
+#         SOPS_AGE_KEY_FILE private key file (default ~/.config/sops/age/keys.txt, where sops looks by itself)
+# Needs:  age (age-keygen), sops >= 3.9 (the `sops encrypt` / `sops decrypt` subcommands)
 # =============================================================================
 set -euo pipefail
 
-AGE_KEY_FILE="${HOME}/.config/sops/age/keys.txt"
-SOPS_CONFIG=".sops.yaml"
-EXAMPLE_SECRET="example-secret.yaml"
-ENCRYPTED_SECRET="example-secret.enc.yaml"
+WORKDIR="${WORKDIR:-./sops-demo}"
+export SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-${HOME}/.config/sops/age/keys.txt}"
+PLAINTEXT="${WORKDIR}/example-secret.yaml"
+ENCRYPTED="${WORKDIR}/example-secret.enc.yaml"
 
-log()  { echo; echo "==> $*"; }
-cmd()  { echo "    \$ $*"; eval "$@"; }
-die()  { echo "[ERROR] $*" >&2; exit 1; }
+log() { printf '\n==> %s\n' "$*"; }
+die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-check_dependencies() {
-    command -v age      &>/dev/null || die "age not found.  Install: apt install age"
-    command -v age-keygen &>/dev/null || die "age-keygen not found. Install: apt install age"
-    command -v sops     &>/dev/null || die "sops not found. Install: https://github.com/getsops/sops/releases"
-}
+for tool in age-keygen sops openssl; do
+  command -v "${tool}" >/dev/null || die "${tool} not found (age: apt install age; sops: https://github.com/getsops/sops/releases)"
+done
+mkdir -p "${WORKDIR}"
 
-# =============================================================================
-# 1. Generate age keypair
-# =============================================================================
+# 1. Keypair --------------------------------------------------------------------------------
 generate_age_key() {
-    log "Step 1: Generate age keypair"
-
-    if [[ -f "${AGE_KEY_FILE}" ]]; then
-        echo "    age key already exists at ${AGE_KEY_FILE} — skipping generation"
-        echo "    To regenerate: rm ${AGE_KEY_FILE} && age-keygen -o ${AGE_KEY_FILE}"
-    else
-        mkdir -p "$(dirname "${AGE_KEY_FILE}")"
-        cmd "age-keygen -o ${AGE_KEY_FILE}"
-        chmod 600 "${AGE_KEY_FILE}"
-        echo "    Private key saved to: ${AGE_KEY_FILE}"
-        echo "    IMPORTANT: Back this up securely. Loss = permanent data loss."
-    fi
-
-    # Extract public key for use in .sops.yaml
-    AGE_PUBLIC_KEY=$(grep "^# public key:" "${AGE_KEY_FILE}" | awk '{print $NF}')
-    echo "    Public key: ${AGE_PUBLIC_KEY}"
-    export AGE_PUBLIC_KEY
+  log "Step 1: age keypair"
+  if [[ -f "${SOPS_AGE_KEY_FILE}" ]]; then
+    echo "    reusing ${SOPS_AGE_KEY_FILE}"
+  else
+    mkdir -p "$(dirname "${SOPS_AGE_KEY_FILE}")"
+    age-keygen -o "${SOPS_AGE_KEY_FILE}" 2>/dev/null
+    chmod 600 "${SOPS_AGE_KEY_FILE}"
+    echo "    private key written to ${SOPS_AGE_KEY_FILE} - back it up; losing it means losing every secret encrypted to it"
+  fi
+  AGE_PUBLIC_KEY="$(age-keygen -y "${SOPS_AGE_KEY_FILE}")"
+  echo "    public key: ${AGE_PUBLIC_KEY}"
 }
 
-# =============================================================================
-# 2. Create .sops.yaml configuration
-# =============================================================================
+# 2. .sops.yaml -----------------------------------------------------------------------------
+# path_regex is matched against the path of the file given to `sops encrypt` (the plaintext input),
+# NOT against the output name. Rules are evaluated top to bottom, first match wins.
+# encrypted_regex limits encryption to the fields that hold secrets: apiVersion, kind and metadata stay
+# readable, so kubeconform, Flux and humans can still read the manifest.
 create_sops_config() {
-    log "Step 2: Create .sops.yaml configuration"
-
-    # .sops.yaml tells SOPS which key to use for each file pattern
-    # Multiple recipients (age public keys) can decrypt — useful for teams
-    cat > "${SOPS_CONFIG}" <<EOF
-# .sops.yaml — SOPS encryption configuration
-# Commit this file to Git (it only contains public keys)
-#
-# Rules are matched top-to-bottom; first match wins.
-# path_regex applies to the file path being encrypted/decrypted.
-
+  log "Step 2: .sops.yaml"
+  cat > "${WORKDIR}/.sops.yaml" <<YAML
 creation_rules:
-  # Kubernetes secrets — encrypt with age + optionally GCP/AWS KMS for CI
-  - path_regex: .*secret.*\.ya?ml$
-    age: >-
-      ${AGE_PUBLIC_KEY}
-    # Add team members' public keys here (comma-separated):
-    # age: >-
-    #   ${AGE_PUBLIC_KEY},
-    #   age1xxxxxxxxxx_teammate1,
-    #   age1xxxxxxxxxx_teammate2
-
-  # Environment files
-  - path_regex: \.env\..*
+  # Kubernetes Secret manifests: only data / stringData are encrypted
+  - path_regex: .*secret.*\.ya?ml\$
+    encrypted_regex: ^(data|stringData)\$
     age: ${AGE_PUBLIC_KEY}
-
-  # All other YAML files in secrets/ directory
-  - path_regex: secrets/.*\.ya?ml$
+  # dotenv-style files are encrypted whole
+  - path_regex: \.env(\..*)?\$
     age: ${AGE_PUBLIC_KEY}
-
-  # Default fallback rule
-  - path_regex: .*
+  # anything else under secrets/
+  - path_regex: (^|.*/)secrets/.*\.(ya?ml|json)\$
     age: ${AGE_PUBLIC_KEY}
-EOF
-
-    echo "    Created ${SOPS_CONFIG}"
-    cat "${SOPS_CONFIG}"
+# Team: list several recipients, any one of them can decrypt:
+#   age: >-
+#     age1alice...,
+#     age1bob...
+YAML
+  sed 's/^/    | /' "${WORKDIR}/.sops.yaml"
 }
 
-# =============================================================================
-# 3. Create example plaintext secret (NEVER commit this)
-# =============================================================================
+# 3. Plaintext (demo values only; gitignored) ---------------------------------------------
 create_example_secret() {
-    log "Step 3: Create example plaintext secret file (do not commit this)"
-
-    cat > "${EXAMPLE_SECRET}" <<'EOF'
-# example-secret.yaml — PLAINTEXT (never commit this file)
+  log "Step 3: plaintext Secret (never commit this)"
+  cat > "${PLAINTEXT}" <<YAML
 apiVersion: v1
 kind: Secret
 metadata:
@@ -120,127 +83,66 @@ metadata:
   namespace: myapp
 type: Opaque
 stringData:
-  database_url: "postgresql://user:${DB_PASSWORD}@postgres:5432/myapp"
-  api_key: "sk_test_abcdef1234567890"
-  jwt_secret: "my-super-secret-jwt-signing-key-32chars"
-  redis_password: "${REDIS_PASSWORD}"
-  smtp_password: "${SMTP_PASSWORD}"
-EOF
-
-    echo "    Created ${EXAMPLE_SECRET}"
-    echo "    WARNING: Add '${EXAMPLE_SECRET}' to .gitignore before committing"
-}
-
-# =============================================================================
-# 4. Encrypt the secret file
-# =============================================================================
-encrypt_secret() {
-    log "Step 4: Encrypt secret file with SOPS + age"
-
-    # SOPS_AGE_KEY_FILE tells SOPS where the private key is for encryption
-    cmd "SOPS_AGE_KEY_FILE=${AGE_KEY_FILE} sops --encrypt ${EXAMPLE_SECRET} > ${ENCRYPTED_SECRET}"
-
-    echo "    Encrypted file: ${ENCRYPTED_SECRET}"
-    echo "    Safe to commit: YES"
-    echo ""
-    echo "    Encrypted content preview:"
-    head -30 "${ENCRYPTED_SECRET}"
-}
-
-# =============================================================================
-# 5. Decrypt the encrypted file
-# =============================================================================
-decrypt_secret() {
-    log "Step 5: Decrypt secret file"
-
-    cmd "SOPS_AGE_KEY_FILE=${AGE_KEY_FILE} sops --decrypt ${ENCRYPTED_SECRET}"
-
-    echo ""
-    echo "    Decrypt to file:"
-    cmd "SOPS_AGE_KEY_FILE=${AGE_KEY_FILE} sops --decrypt ${ENCRYPTED_SECRET} > /tmp/decrypted-secret.yaml"
-    echo "    Decrypted to /tmp/decrypted-secret.yaml (never write to project directory)"
-}
-
-# =============================================================================
-# 6. Edit encrypted file in-place (SOPS decrypts, opens editor, re-encrypts)
-# =============================================================================
-show_edit_usage() {
-    log "Step 6: Edit encrypted file in-place"
-    echo "    To edit an encrypted file directly:"
-    echo "    \$ SOPS_AGE_KEY_FILE=${AGE_KEY_FILE} sops ${ENCRYPTED_SECRET}"
-    echo ""
-    echo "    SOPS will:"
-    echo "      1. Decrypt to a temp file"
-    echo "      2. Open \$EDITOR"
-    echo "      3. Re-encrypt on save"
-    echo "      4. Only changed values appear in git diff"
-}
-
-# =============================================================================
-# 7. Update .gitignore to protect plaintext files
-# =============================================================================
-update_gitignore() {
-    log "Step 7: Update .gitignore"
-
-    local gitignore="../.gitignore"
-    if ! grep -q "example-secret.yaml" "${gitignore}" 2>/dev/null; then
-        cat >> "${gitignore}" <<'EOF'
-
-# SOPS: plaintext secrets (encrypted .enc.yaml files ARE safe to commit)
-*-secret.yaml
-*-secrets.yaml
-*.secret.yaml
-!*.enc.yaml
-.sops-age-key.txt
-EOF
-        echo "    Updated ${gitignore}"
-    else
-        echo "    .gitignore already configured"
-    fi
-}
-
-# =============================================================================
-# 8. Use in CI/CD — decrypt with key from environment variable
-# =============================================================================
-show_ci_usage() {
-    log "Step 8: CI/CD usage"
-    echo ""
-    echo "    In CI (GitHub Actions / Jenkins), store age private key as a secret:"
-    echo ""
-    echo "    GitHub Actions example:"
-    cat <<'YAML'
-    - name: Decrypt secrets
-      env:
-        SOPS_AGE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
-      run: |
-        echo "$SOPS_AGE_KEY" > /tmp/age-key.txt
-        SOPS_AGE_KEY_FILE=/tmp/age-key.txt sops --decrypt k8s/secret.enc.yaml | kubectl apply -f -
-        rm /tmp/age-key.txt
+  database_url: "postgresql://user:$(openssl rand -hex 8)@postgres:5432/myapp"
+  api_key: "example-api-key-not-real"
+  jwt_secret: "$(openssl rand -hex 16)"
 YAML
-    echo ""
-    echo "    Or use SOPS_AGE_KEY env var directly (no file needed):"
-    echo "    \$ export SOPS_AGE_KEY=\$(cat ~/.config/sops/age/keys.txt | grep -v '^#')"
-    echo "    \$ sops --decrypt ${ENCRYPTED_SECRET}"
+  echo "    wrote ${PLAINTEXT}"
 }
 
-# --- Main --------------------------------------------------------------------
-main() {
-    check_dependencies
-    generate_age_key
-    create_sops_config
-    create_example_secret
-    encrypt_secret
-    decrypt_secret
-    show_edit_usage
-    update_gitignore
-    show_ci_usage
+# 4. Encrypt (needs only the PUBLIC key; the private key file is not used here) ------------
+encrypt_secret() {
+  log "Step 4: encrypt"
+  # --config is explicit here because sops searches for .sops.yaml from the current directory upwards,
+  # and the demo files live in ${WORKDIR}. In a real repo the file sits at the root and no flag is needed.
+  sops --config "${WORKDIR}/.sops.yaml" encrypt "${PLAINTEXT}" > "${ENCRYPTED}"
+  grep -q '^sops:' "${ENCRYPTED}" || die "no sops metadata in ${ENCRYPTED}"
+  if grep -q 'example-api-key-not-real' "${ENCRYPTED}"; then die "plaintext leaked into ${ENCRYPTED}"; fi
+  grep -q 'name: myapp-secrets' "${ENCRYPTED}" || die "metadata.name should stay readable (encrypted_regex)"
+  echo "    ${ENCRYPTED} is safe to commit. Readable parts: apiVersion, kind, metadata. Encrypted: stringData."
+  sed -n '1,14p' "${ENCRYPTED}" | sed 's/^/    | /'
+}
 
-    echo ""
-    echo "=== SOPS + age setup complete ==="
-    echo "    Private key: ${AGE_KEY_FILE}"
-    echo "    Config:      ${SOPS_CONFIG}"
-    echo "    Encrypted:   ${ENCRYPTED_SECRET} (commit this)"
-    echo "    Plaintext:   ${EXAMPLE_SECRET} (DO NOT commit)"
+# 5. Decrypt + prove the round trip ------------------------------------------------------
+decrypt_secret() {
+  log "Step 5: decrypt and compare"
+  local got
+  got="$(sops decrypt --extract '["stringData"]["api_key"]' "${ENCRYPTED}")"
+  [[ "${got}" == "example-api-key-not-real" ]] || die "decrypted api_key does not match the original"
+  echo "    round trip OK: api_key decrypts back to its original value"
+  # sops re-indents YAML (4 spaces), so compare values, not bytes. Whole file to stdout:
+  #   sops decrypt "${ENCRYPTED}"
+  # Variants worth knowing:
+  #   sops decrypt --extract '["stringData"]["api_key"]' file   one value
+  #   sops edit file                                            decrypt -> $EDITOR -> re-encrypt
+  #   sops set file '["stringData"]["api_key"]' '"new"'          change one value without opening an editor
+}
+
+# 6. CI / GitOps ---------------------------------------------------------------------------
+show_ci_usage() {
+  log "Step 6: CI usage"
+  cat <<'TXT'
+    Keep the private key in the CI secret store and hand it to sops through the environment,
+    not through a file on disk:
+
+      env:
+        SOPS_AGE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}      # the whole contents of keys.txt
+      run: sops decrypt k8s/secret.enc.yaml | kubectl apply -f -
+
+    Protect plaintext from being committed (add to .gitignore):
+      *-secret.yaml
+      !*.enc.yaml
+TXT
+}
+
+main() {
+  generate_age_key
+  create_sops_config
+  create_example_secret
+  encrypt_secret
+  decrypt_secret
+  show_ci_usage
+  printf '\n=== SOPS + age done ===\n    commit: %s and %s/.sops.yaml\n    never commit: %s or the private key\n' "${ENCRYPTED}" "${WORKDIR}" "${PLAINTEXT}"
 }
 
 main "$@"

@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Pod
+metadata: {name: nolimits, namespace: shop}
+spec:
+  containers:
+    - name: app
+      image: ghcr.io/my-org/app:1.0
+      resources: {limits: {cpu: 500m}}

@@ -1,12 +1,14 @@
 # =============================================================================
 # l2-custom-rules.yaml — Falco Level 2: Custom runtime security detection rules
 #
-# Apply as a ConfigMap:
-#   kubectl create configmap falco-custom-rules \
-#     --from-file=custom_rules.yaml=l2-custom-rules.yaml \
-#     --namespace falco --dry-run=client -o yaml | kubectl apply -f -
+# Ship with the Helm chart (it mounts customRules into /etc/falco/rules.d):
+#   helm upgrade --install falco falcosecurity/falco --version 9.2.1 -n falco --create-namespace \
+#     -f l1-install-helm-values.yaml --set-file customRules.custom-rules\\.yaml=l2-custom-rules.yaml
 #
-# Or mount directly into Falco pod at /etc/falco/rules.d/custom_rules.yaml
+# Validate offline (no kernel driver needed). The default rules file defines the macros used here
+# (spawned_process, container, open_write, outbound), so load it first:
+#   docker run --rm --entrypoint falco -v "$PWD":/r:ro falcosecurity/falco:0.45.1 \
+#     -V /etc/falco/falco_rules.yaml -V /r/l2-custom-rules.yaml
 #
 # Rule anatomy:
 #   - rule:      unique rule name
@@ -16,6 +18,8 @@
 #   - priority:  EMERGENCY|ALERT|CRITICAL|ERROR|WARNING|NOTICE|INFORMATIONAL|DEBUG
 #   - tags:      categorization labels
 # =============================================================================
+
+- required_engine_version: 0.57.0
 
 # --- Macros: reusable filter building blocks ---------------------------------
 
@@ -38,13 +42,14 @@
       "puppet/puppet-agent"
     ))
 
-# Shell binaries that indicate interactive or script-based access
-- macro: shell_binaries
+# Names are prefixed `lab_` on purpose: the default ruleset already defines shell_binaries and
+# package_mgmt_binaries, and redefining a macro without `override:` silently replaces (or errors on) it.
+- macro: lab_shell_binaries
   condition: >
     proc.name in (bash, sh, zsh, ksh, fish, tcsh, dash, ash)
 
-# Common package managers — their use at runtime is suspicious
-- macro: package_mgmt_binaries
+# Package managers: using one at runtime bypasses image scanning
+- macro: lab_package_managers
   condition: >
     proc.name in (apt, apt-get, yum, dnf, apk, pip, pip3, npm, yarn, gem, cargo)
 
@@ -53,18 +58,13 @@
 - list: sensitive_host_paths
   items:
     - /etc/shadow
-    - /etc/passwd
     - /etc/sudoers
     - /root/.ssh
-    - /home/.ssh
     - /etc/kubernetes/pki
     - /var/lib/kubelet/pki
-    - /run/secrets/kubernetes.io
 
 - list: crypto_mining_processes
-  items:
-    - xmrig, xmr-stak, minerd, cpuminer, ethminer,
-      claymore, phoenixminer, lolminer, nbminer
+  items: [xmrig, xmr-stak, minerd, cpuminer, ethminer, claymore, phoenixminer, lolminer, nbminer]
 
 # --- Rules -------------------------------------------------------------------
 
@@ -77,8 +77,8 @@
   condition: >
     spawned_process
     and container
-    and shell_binaries
-    and not container.image.repository in (kindest/node)
+    and lab_shell_binaries
+    and not trusted_privileged_containers
     and not proc.pname in (runc, containerd-shim, systemd)
   output: >
     Shell spawned in container
@@ -98,7 +98,7 @@
   condition: >
     spawned_process
     and container
-    and package_mgmt_binaries
+    and lab_package_managers
     and not config_management_containers
   output: >
     Package manager executed in container
@@ -140,7 +140,7 @@
     Crypto mining process detected
     (user=%user.name proc=%proc.name cmdline=%proc.cmdline
      container=%container.name image=%container.image.repository:%container.image.tag
-     pod=%k8s.pod.name ns=%k8s.ns.name host=%host.name)
+     pod=%k8s.pod.name ns=%k8s.ns.name)
   priority: CRITICAL
   tags: [host, container, crypto_mining, mitre_impact, T1496]
 
@@ -172,7 +172,7 @@
   condition: >
     spawned_process
     and container
-    and proc.name = "kubectl"
+    and proc.name = kubectl
   output: >
     kubectl executed inside pod
     (user=%user.name cmdline=%proc.cmdline
@@ -182,11 +182,18 @@
   tags: [container, kubernetes, mitre_discovery, T1613]
 
 # Rule 7: Container running as root UID 0
-# Informational — root containers are risky even if not yet exploited
+# Disabled by default: nearly every container process is root, so this is a noisy inventory rule rather
+# than an alert. (It used to be NOTICE while the chart only emitted WARNING and above, i.e. it never fired.)
+# Turn it on, with a priority above your `falco.priority` threshold, from your own rules file:
+#   - rule: Container Running as Root User
+#     enabled: true
+#     priority: WARNING
+#     override: {enabled: replace, priority: replace}
 - rule: Container Running as Root User
   desc: >
     A container process is running as UID 0 (root). While not immediately an
     attack, root containers have a much larger blast radius if compromised.
+  enabled: false
   condition: >
     spawned_process
     and container
@@ -210,7 +217,7 @@
   condition: >
     open_write
     and container
-    and fd.name in (/etc/hosts, /etc/resolv.conf, /etc/hostname)
+    and fd.name in ("/etc/hosts", "/etc/resolv.conf", "/etc/hostname")
   output: >
     DNS config file modified in container
     (user=%user.name file=%fd.name proc=%proc.name cmdline=%proc.cmdline

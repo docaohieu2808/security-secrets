@@ -1,115 +1,81 @@
 # =============================================================================
-# l1-install-controller.yaml — Sealed Secrets: Install controller via Helm
+# l1 - Sealed Secrets: controller values (chart sealed-secrets-2.20.0, controller 0.40.0)
 #
-# Sealed Secrets encrypts K8s Secrets into SealedSecret CRDs that are safe
-# to store in Git. Only the in-cluster controller can decrypt them.
+# A SealedSecret is a Secret encrypted with the controller's public key, so the YAML is safe in Git.
+# Only the controller, which holds the private key, can turn it back into a Secret.
 #
-# Architecture:
-#   kubeseal CLI (local) → encrypts with controller public key
-#   SealedSecret CR → stored in Git → applied to cluster
-#   Controller (in-cluster) → decrypts → creates native K8s Secret
+#   kubeseal (local)  --encrypt with public cert-->  SealedSecret YAML  --git/kubectl-->  cluster
+#   controller        --decrypt with private key--> native Secret
 #
-# Install controller:
-#   helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
-#   helm repo update
-#   helm install sealed-secrets sealed-secrets/sealed-secrets \
-#     --namespace kube-system \
-#     --values l1-install-controller.yaml
+# Install (the chart repo moved from bitnami-labs.github.io to bitnami.github.io):
+#   helm repo add sealed-secrets https://bitnami.github.io/sealed-secrets && helm repo update
+#   helm install sealed-secrets sealed-secrets/sealed-secrets --version 2.20.0 \
+#     --namespace kube-system -f l1-install-controller.yaml
 #
-# Install kubeseal CLI (Linux amd64):
-#   KUBESEAL_VERSION=$(curl -s https://api.github.com/repos/bitnami-labs/sealed-secrets/tags \
-#     | jq -r '.[0].name' | cut -c 2-)
-#   curl -OL "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-amd64.tar.gz"
-#   tar -xzf kubeseal-${KUBESEAL_VERSION}-linux-amd64.tar.gz kubeseal
-#   sudo install -m 755 kubeseal /usr/local/bin/kubeseal
+# kubeseal (match the controller minor version; verify the release checksum):
+#   V=0.40.0
+#   curl -fsSLO "https://github.com/bitnami/sealed-secrets/releases/download/v${V}/kubeseal-${V}-linux-amd64.tar.gz"
+#   curl -fsSLO "https://github.com/bitnami/sealed-secrets/releases/download/v${V}/sealed-secrets_${V}_checksums.txt"
+#   grep "kubeseal-${V}-linux-amd64.tar.gz" "sealed-secrets_${V}_checksums.txt" | sha256sum -c -
+#   tar -xzf "kubeseal-${V}-linux-amd64.tar.gz" kubeseal && sudo install -m 755 kubeseal /usr/local/bin/
+#
+# Values below were checked against `helm show values sealed-secrets/sealed-secrets --version 2.20.0`.
+# Helm ignores keys a chart does not define, so a misspelled key fails silently; CI runs helm template
+# and asserts the settings landed in the rendered manifests.
 # =============================================================================
 
-# --- Controller configuration ------------------------------------------------
+# kubeseal looks for a controller called `sealed-secrets-controller` in `kube-system`. The chart names it
+# after the release (`sealed-secrets`), so pin the name instead of passing --controller-name every time.
+fullnameOverride: sealed-secrets-controller
+
 image:
   registry: docker.io
   repository: bitnami/sealed-secrets-controller
-  tag: ""            # Leave empty to use chart default (latest stable)
+  tag: 0.40.0
   pullPolicy: IfNotPresent
 
-# Controller runs in kube-system by default — change only if required
-# namespace: kube-system
+# --- Sealing key lifecycle ---------------------------------------------------
+# A new sealing key is generated every keyrenewperiod; OLD KEYS ARE KEPT so existing SealedSecrets still
+# decrypt. Rotation protects future secrets and shrinks the blast radius of a leaked key; it does not
+# re-encrypt what is already in Git (do that with `kubeseal --re-encrypt`, see l2).
+keyrenewperiod: "720h"        # 30 days; "0" disables
+keyttl: "87600h"              # certificate validity (10 years)
 
-# --- Key management ----------------------------------------------------------
-# Controller generates a RSA-4096 keypair on first install.
-# The public key is used by kubeseal to encrypt. Private key stays in cluster.
+# Extra namespaces to watch besides the release namespace (empty = all)
+additionalNamespaces: []
 
-# Rotate sealing key every N days (0 = disable automatic rotation)
-# After rotation, old keys are kept so existing SealedSecrets still work.
-keyrenewperiod: "720h"    # 30 days
-
-# Keep N old sealing keys after rotation (for decrypting old SealedSecrets)
-# Set higher if you have long-lived SealedSecrets that may not be rotated
-acceptancepolicy: ""
-
-# --- Security ----------------------------------------------------------------
-securityContext:
-  runAsNonRoot: true
-  runAsUser: 1001
+# --- Hardening (these are the chart's own keys) -------------------------------
+podSecurityContext:
+  enabled: true
   fsGroup: 65534
   seccompProfile:
     type: RuntimeDefault
 
 containerSecurityContext:
-  allowPrivilegeEscalation: false
+  enabled: true
+  runAsNonRoot: true
+  runAsUser: 1001
   readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
   capabilities:
     drop: [ALL]
 
-# --- Resources ---------------------------------------------------------------
 resources:
-  requests:
-    cpu: 50m
-    memory: 64Mi
-  limits:
-    cpu: 200m
-    memory: 128Mi
+  requests: {cpu: 50m, memory: 64Mi}
+  limits: {cpu: 200m, memory: 128Mi}
 
-# --- Service -----------------------------------------------------------------
-service:
-  type: ClusterIP
-  port: 8080
-  # Expose metrics for Prometheus scraping
-  metricsPort: 8081
+# --- Metrics -----------------------------------------------------------------
+metrics:
+  serviceMonitor:
+    enabled: false            # true with the Prometheus Operator installed
 
-# --- Metrics / monitoring ----------------------------------------------------
-serviceMonitor:
-  enabled: false    # Set true if Prometheus Operator is installed
-  namespace: monitoring
-  labels:
-    release: prometheus
-
-# --- RBAC --------------------------------------------------------------------
-rbac:
-  create: true
-  clusterRole: true    # Controller needs cluster-wide Secret write access
+# --- Availability / network ---------------------------------------------------
+pdb:
+  create: false               # one replica: a PDB would block node drains
+networkPolicy:
+  enabled: false
 
 serviceAccount:
   create: true
-  name: sealed-secrets-controller
-
-# --- Network policy ----------------------------------------------------------
-networkPolicy:
-  enabled: false    # Set true to restrict controller egress/ingress
-
-# --- Pod disruption budget ---------------------------------------------------
-podDisruptionBudget:
-  enabled: false
-
-# --- Node placement ----------------------------------------------------------
-nodeSelector: {}
-tolerations: []
-affinity: {}
-
-# --- Ingress (not recommended — controller has no web UI) --------------------
-ingress:
-  enabled: false
-
-# --- Additional sealed secrets namespaces ------------------------------------
-# By default controller watches all namespaces.
-# Restrict with: --set "commandArgs={--namespace=myapp}"
-commandArgs: []
+rbac:
+  create: true

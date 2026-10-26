@@ -1,0 +1,158 @@
+# ConstraintTemplates for OPA Gatekeeper (Rego v1 syntax, opt-in since Gatekeeper 3.19).
+#
+# A ConstraintTemplate defines the policy (Rego) and the schema of its parameters; a Constraint
+# (constraints.yaml) instantiates it. Apply templates first and wait for the CRDs they create:
+#
+#   helm repo add gatekeeper https://open-policy-agent.github.io/gatekeeper/charts
+#   helm install gatekeeper gatekeeper/gatekeeper --version 3.23.1 \
+#     --namespace gatekeeper-system --create-namespace
+#   kubectl apply -f templates.yaml
+#   kubectl wait --for=condition=established --timeout=60s crd/k8srequiredlabels.constraints.gatekeeper.sh
+#   kubectl apply -f constraints.yaml
+#
+# Offline test (no cluster): gator verify ./tests   (gator is the Gatekeeper CLI)
+#
+# Pod-level templates read spec.containers, so their Constraints match Pods only. Deployments,
+# StatefulSets and Jobs are covered because the controllers create Pods, and Gatekeeper sees those.
+# (Matching Deployment here would never fire: their containers live under spec.template.spec.)
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+  annotations:
+    description: Requires the listed labels to be present on the object.
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      code:
+        - engine: Rego
+          source:
+            version: "v1"
+            rego: |
+              package k8srequiredlabels
+
+              violation contains {"msg": msg} if {
+                provided := {label | some label, _ in input.review.object.metadata.labels}
+                required := {label | some label in input.parameters.labels}
+                missing := required - provided
+                count(missing) > 0
+                msg := sprintf("%v %q is missing required labels: %v", [input.review.object.kind, input.review.object.metadata.name, missing])
+              }
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdenyprivilegedcontainers
+  annotations:
+    description: Denies containers (and init containers) that run privileged.
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDenyPrivilegedContainers
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      code:
+        - engine: Rego
+          source:
+            version: "v1"
+            rego: |
+              package k8sdenyprivilegedcontainers
+
+              all_containers contains c if {
+                some c in input.review.object.spec.containers
+              }
+
+              all_containers contains c if {
+                some c in input.review.object.spec.initContainers
+              }
+
+              violation contains {"msg": msg} if {
+                some c in all_containers
+                c.securityContext.privileged == true
+                msg := sprintf("Container %q in %q runs privileged; remove securityContext.privileged", [c.name, input.review.object.metadata.name])
+              }
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequireresourcelimits
+  annotations:
+    description: Requires CPU and memory limits on every container.
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequireResourceLimits
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      code:
+        - engine: Rego
+          source:
+            version: "v1"
+            rego: |
+              package k8srequireresourcelimits
+
+              violation contains {"msg": msg} if {
+                some c in input.review.object.spec.containers
+                not c.resources.limits.memory
+                msg := sprintf("Container %q has no memory limit", [c.name])
+              }
+
+              violation contains {"msg": msg} if {
+                some c in input.review.object.spec.containers
+                not c.resources.limits.cpu
+                msg := sprintf("Container %q has no CPU limit", [c.name])
+              }
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sallowedregistries
+  annotations:
+    description: Restricts images to approved registry prefixes.
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sAllowedRegistries
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            registries:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      code:
+        - engine: Rego
+          source:
+            version: "v1"
+            rego: |
+              package k8sallowedregistries
+
+              violation contains {"msg": msg} if {
+                some c in input.review.object.spec.containers
+                not from_allowed_registry(c.image)
+                msg := sprintf("Container %q uses image %q from an unapproved registry; allowed: %v", [c.name, c.image, input.parameters.registries])
+              }
+
+              from_allowed_registry(image) if {
+                some registry in input.parameters.registries
+                startswith(image, registry)
+              }

@@ -1,230 +1,122 @@
 #!/usr/bin/env bash
 # =============================================================================
-# l5-transit-encryption.sh — Vault: Transit engine encrypt/decrypt as a service
+# l5 - Vault Transit: encryption, signing and HMAC as a service (keys never leave Vault)
 #
-# Transit engine provides cryptographic operations WITHOUT storing the plaintext.
-# Applications encrypt/decrypt data through Vault API — keys never leave Vault.
+# The application sends data to Vault, stores only the ciphertext, and asks Vault to decrypt when it needs the
+# plaintext. Rotating a key does not force a mass re-encryption: old versions still decrypt, and `rewrap` upgrades a
+# ciphertext without the plaintext ever reaching the caller.
 #
-# Use cases:
-#   - Encrypt PII/PAN data before storing in database
-#   - Sign and verify application payloads (JWT-like)
-#   - Generate HMACs for tamper detection
-#   - Key rotation without re-encrypting all data (convergent encryption)
-#   - Rewrap ciphertexts after key rotation
-#
-# Usage:
-#   export VAULT_ADDR=http://127.0.0.1:8200
-#   export VAULT_TOKEN=dev-root-token
+#   export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=dev-root-token
 #   ./l5-transit-encryption.sh
-#
-# Prerequisites:
-#   - vault CLI, base64, jq
+# Re-runnable: the demo keys are deleted and recreated first (deletion_allowed=true is a lab choice; real keys
+# keep the default false so nobody can destroy the data they protect).
+# Needs: vault, jq, base64; a dev server from l1.
 # =============================================================================
 set -euo pipefail
+# shellcheck source=lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
-VAULT_TOKEN="${VAULT_TOKEN:-dev-root-token}"
-MOUNT_PATH="transit"
+MOUNT="transit"
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
-export VAULT_ADDR VAULT_TOKEN
+require vault; require jq; require base64
+wait_for_vault
 
-log()  { echo; echo "==> $*"; }
-cmd()  { echo "    \$ $*"; eval "$@"; }
+log "Step 1: enable Transit at ${MOUNT}/"
+ensure_mount "${MOUNT}" transit
 
-# =============================================================================
-# 1. Enable Transit secrets engine
-# =============================================================================
-log "Step 1: Enable Transit secrets engine at '${MOUNT_PATH}/'"
-vault secrets enable -path=${MOUNT_PATH} transit 2>/dev/null || \
-    echo "    (already enabled — continuing)"
+reset_key() { # <name> <create args...>
+  local name="$1"; shift
+  if vault read "${MOUNT}/keys/${name}" >/dev/null 2>&1; then
+    vault write "${MOUNT}/keys/${name}/config" deletion_allowed=true >/dev/null
+    vault delete "${MOUNT}/keys/${name}" >/dev/null
+  fi
+  vault write -f "${MOUNT}/keys/${name}" "$@" >/dev/null
+  vault write "${MOUNT}/keys/${name}/config" deletion_allowed=true >/dev/null   # a config setting, not a create parameter
+  info "created key ${name} ($*)"
+}
 
-# =============================================================================
-# 2. Create encryption keys for different use cases
-# =============================================================================
-log "Step 2: Create named encryption keys"
+log "Step 2: named keys, one per purpose"
+reset_key user-pii type=aes256-gcm96 exportable=false allow_plaintext_backup=false
+# convergent + derived: the same plaintext AND context always give the same ciphertext, which allows equality search
+# on encrypted columns at the cost of leaking which rows are equal
+reset_key db-field-encryption type=aes256-gcm96 derived=true convergent_encryption=true
+reset_key payload-signing type=ed25519
+run vault list "${MOUNT}/keys"
+run vault read "${MOUNT}/keys/user-pii"
 
-# Key for encrypting user PII (AES-256-GCM96 — default, fast, authenticated)
-cmd "vault write -f ${MOUNT_PATH}/keys/user-pii \
-    type=aes256-gcm96 \
-    deletion_allowed=false \
-    exportable=false \
-    allow_plaintext_backup=false"
-
-# Key for database field encryption (convergent = same plaintext → same ciphertext,
-# useful for encrypted search/indexing but reduces security slightly)
-cmd "vault write -f ${MOUNT_PATH}/keys/db-field-encryption \
-    type=aes256-gcm96 \
-    convergent_encryption=true \
-    derived=true \
-    deletion_allowed=false"
-
-# Key for signing payloads (Ed25519 — fast EdDSA signatures)
-cmd "vault write -f ${MOUNT_PATH}/keys/payload-signing \
-    type=ed25519 \
-    deletion_allowed=false"
-
-# Key for HMAC operations (sha2-256 HMAC)
-cmd "vault write -f ${MOUNT_PATH}/keys/hmac-auth \
-    type=hmac \
-    deletion_allowed=false" || \
-    # HMAC key type may need different syntax depending on Vault version
-    cmd "vault write -f ${MOUNT_PATH}/keys/hmac-auth type=aes256-gcm96"
-
-log "All transit keys:"
-cmd "vault list ${MOUNT_PATH}/keys"
-
-# Key details
-cmd "vault read ${MOUNT_PATH}/keys/user-pii"
-
-# =============================================================================
-# 3. Encrypt plaintext data
-# =============================================================================
-log "Step 3: Encrypt plaintext (Transit receives base64-encoded input)"
-
+log "Step 3: encrypt (Transit takes base64)"
 PLAINTEXT="Hello, this is sensitive PII: SSN 123-45-6789"
-PLAINTEXT_B64=$(echo -n "${PLAINTEXT}" | base64)
-echo "    Plaintext: ${PLAINTEXT}"
-echo "    Base64:    ${PLAINTEXT_B64}"
+ENCRYPT_RESPONSE="$(vault write -format=json "${MOUNT}/encrypt/user-pii" plaintext="$(b64 "${PLAINTEXT}")")"
+CIPHERTEXT="$(jq -r '.data.ciphertext' <<<"${ENCRYPT_RESPONSE}")"
+info "ciphertext (safe to store in a database): ${CIPHERTEXT}"
+assert_eq "key version used" "$(jq -r '.data.key_version' <<<"${ENCRYPT_RESPONSE}")" "1"
+log "Batch: several values in one request (the CLI sends k=v pairs as strings, so a JSON array needs a whole-body file)"
+batch="$(mktemp)"
+trap 'rm -f "${batch}"' EXIT
+jq -nc --arg a "$(b64 'email@example.com')" --arg b "$(b64 'phone: 555-0100')" '{batch_input: [{plaintext: $a}, {plaintext: $b}]}' > "${batch}"
+assert_eq "batch results" "$(vault write -format=json "${MOUNT}/encrypt/user-pii" @"${batch}" | jq -r '.data.batch_results | length')" "2"
 
-# Encrypt using user-pii key
-ENCRYPT_RESPONSE=$(vault write -format=json ${MOUNT_PATH}/encrypt/user-pii \
-    plaintext="${PLAINTEXT_B64}")
-CIPHERTEXT=$(echo "${ENCRYPT_RESPONSE}" | jq -r '.data.ciphertext')
-KEY_VERSION=$(echo "${ENCRYPT_RESPONSE}" | jq -r '.data.key_version')
+log "Step 4: decrypt"
+DECRYPTED="$(vault write -format=json "${MOUNT}/decrypt/user-pii" ciphertext="${CIPHERTEXT}" | jq -r '.data.plaintext' | base64 -d)"
+assert_eq "decrypts to the original" "${DECRYPTED}" "${PLAINTEXT}"
 
-echo "    Ciphertext: ${CIPHERTEXT}"
-echo "    Key version used: ${KEY_VERSION}"
-echo "    (Store this ciphertext in your database — it is safe to store)"
+log "Step 4b: convergent key - same input + context, same ciphertext"
+ctx="$(b64 'tenant-42')"
+c1="$(vault write -format=json "${MOUNT}/encrypt/db-field-encryption" plaintext="$(b64 'a@example.com')" context="${ctx}" | jq -r '.data.ciphertext')"
+c2="$(vault write -format=json "${MOUNT}/encrypt/db-field-encryption" plaintext="$(b64 'a@example.com')" context="${ctx}" | jq -r '.data.ciphertext')"
+assert_eq "deterministic ciphertext" "${c1}" "${c2}"
+c3="$(vault write -format=json "${MOUNT}/encrypt/user-pii" plaintext="$(b64 'a@example.com')" | jq -r '.data.ciphertext')"
+c4="$(vault write -format=json "${MOUNT}/encrypt/user-pii" plaintext="$(b64 'a@example.com')" | jq -r '.data.ciphertext')"
+[[ "${c3}" != "${c4}" ]] || die "non-convergent key produced identical ciphertexts"
+info "ok: a normal key gives a different ciphertext every time"
 
-# Encrypt batch of items (more efficient for bulk operations)
-log "Batch encrypt multiple values:"
-cmd "vault write ${MOUNT_PATH}/encrypt/user-pii \
-    batch_input='[
-        {\"plaintext\": \"$(echo -n 'email@example.com' | base64)\"},
-        {\"plaintext\": \"$(echo -n 'phone: 555-0100' | base64)\"},
-        {\"plaintext\": \"$(echo -n 'DOB: 1990-01-15' | base64)\"}
-    ]'"
+log "Step 5: sign and verify (Ed25519; the hash algorithm is not used for this key type)"
+PAYLOAD='{"user_id":42,"action":"transfer","amount":1000}'
+SIGNATURE="$(vault write -format=json "${MOUNT}/sign/payload-signing" input="$(b64 "${PAYLOAD}")" | jq -r '.data.signature')"
+info "signature: ${SIGNATURE}"
+assert_eq "valid signature verifies" "$(vault write -format=json "${MOUNT}/verify/payload-signing" input="$(b64 "${PAYLOAD}")" signature="${SIGNATURE}" | jq -r '.data.valid')" "true"
+TAMPERED='{"user_id":42,"action":"transfer","amount":9999}'
+assert_eq "tampered payload is rejected" "$(vault write -format=json "${MOUNT}/verify/payload-signing" input="$(b64 "${TAMPERED}")" signature="${SIGNATURE}" | jq -r '.data.valid')" "false"
 
-# =============================================================================
-# 4. Decrypt ciphertext
-# =============================================================================
-log "Step 4: Decrypt ciphertext"
-DECRYPT_RESPONSE=$(vault write -format=json ${MOUNT_PATH}/decrypt/user-pii \
-    ciphertext="${CIPHERTEXT}")
-DECRYPTED_B64=$(echo "${DECRYPT_RESPONSE}" | jq -r '.data.plaintext')
-DECRYPTED=$(echo "${DECRYPTED_B64}" | base64 -d)
+log "Step 6: HMAC (any key can produce one; here the AES key user-pii)"
+HMAC="$(vault write -format=json "${MOUNT}/hmac/user-pii" input="$(b64 "${PAYLOAD}")" algorithm=sha2-256 | jq -r '.data.hmac')"
+info "hmac: ${HMAC}"
+assert_eq "hmac verifies" "$(vault write -format=json "${MOUNT}/verify/user-pii" input="$(b64 "${PAYLOAD}")" hmac="${HMAC}" algorithm=sha2-256 | jq -r '.data.valid')" "true"
 
-echo "    Decrypted base64: ${DECRYPTED_B64}"
-echo "    Decrypted text:   ${DECRYPTED}"
-[[ "${DECRYPTED}" == "${PLAINTEXT}" ]] && echo "    Verification: PASSED" || echo "    Verification: FAILED"
+log "Step 7: rotate the key (version 2); version 1 ciphertext keeps working"
+run vault write -f "${MOUNT}/keys/user-pii/rotate"
+assert_eq "latest version" "$(vault read -format=json "${MOUNT}/keys/user-pii" | jq -r '.data.latest_version')" "2"
+NEW_RESPONSE="$(vault write -format=json "${MOUNT}/encrypt/user-pii" plaintext="$(b64 "${PLAINTEXT}")")"
+assert_eq "new encryptions use version 2" "$(jq -r '.data.key_version' <<<"${NEW_RESPONSE}")" "2"
+assert_eq "old ciphertext still decrypts" "$(vault write -format=json "${MOUNT}/decrypt/user-pii" ciphertext="${CIPHERTEXT}" | jq -r '.data.plaintext' | base64 -d)" "${PLAINTEXT}"
 
-# =============================================================================
-# 5. Sign and verify payloads
-# =============================================================================
-log "Step 5: Sign and verify a payload using Ed25519 key"
+log "Step 8: rewrap - upgrade the old ciphertext to version 2 without exposing the plaintext"
+REWRAPPED="$(vault write -format=json "${MOUNT}/rewrap/user-pii" ciphertext="${CIPHERTEXT}" | jq -r '.data.ciphertext')"
+info "before: ${CIPHERTEXT}"
+info "after:  ${REWRAPPED}"
+[[ "${REWRAPPED}" == vault:v2:* ]] || die "rewrapped ciphertext is not version 2"
 
-PAYLOAD='{"user_id":42,"action":"transfer","amount":1000,"ts":1700000000}'
-PAYLOAD_B64=$(echo -n "${PAYLOAD}" | base64)
+log "Step 9: retire version 1"
+run vault write "${MOUNT}/keys/user-pii/config" min_decryption_version=2
+if vault write "${MOUNT}/decrypt/user-pii" ciphertext="${CIPHERTEXT}" >/dev/null 2>&1; then
+  die "a version 1 ciphertext still decrypts after min_decryption_version=2"
+fi
+info "ok: the version 1 ciphertext is rejected now (rewrap everything BEFORE raising min_decryption_version)"
+assert_eq "the rewrapped ciphertext still works" "$(vault write -format=json "${MOUNT}/decrypt/user-pii" ciphertext="${REWRAPPED}" | jq -r '.data.plaintext' | base64 -d)" "${PLAINTEXT}"
 
-# Sign the payload
-SIGN_RESPONSE=$(vault write -format=json ${MOUNT_PATH}/sign/payload-signing \
-    input="${PAYLOAD_B64}" \
-    hash_algorithm=sha2-256)
-SIGNATURE=$(echo "${SIGN_RESPONSE}" | jq -r '.data.signature')
-echo "    Payload:   ${PAYLOAD}"
-echo "    Signature: ${SIGNATURE}"
-
-# Verify the signature
-VERIFY_RESPONSE=$(vault write -format=json ${MOUNT_PATH}/verify/payload-signing \
-    input="${PAYLOAD_B64}" \
-    signature="${SIGNATURE}" \
-    hash_algorithm=sha2-256)
-VALID=$(echo "${VERIFY_RESPONSE}" | jq -r '.data.valid')
-echo "    Signature valid: ${VALID}"
-
-# Verify tampered payload (should fail)
-TAMPERED_B64=$(echo -n '{"user_id":42,"action":"transfer","amount":9999,"ts":1700000000}' | base64)
-TAMPERED_VERIFY=$(vault write -format=json ${MOUNT_PATH}/verify/payload-signing \
-    input="${TAMPERED_B64}" \
-    signature="${SIGNATURE}" \
-    hash_algorithm=sha2-256 2>/dev/null || echo '{"data":{"valid":false}}')
-echo "    Tampered payload valid: $(echo "${TAMPERED_VERIFY}" | jq -r '.data.valid')"
-
-# =============================================================================
-# 6. HMAC generation for tamper detection
-# =============================================================================
-log "Step 6: Generate HMAC for data integrity verification"
-HMAC_RESPONSE=$(vault write -format=json ${MOUNT_PATH}/hmac/user-pii \
-    input="${PAYLOAD_B64}" \
-    algorithm=sha2-256)
-HMAC=$(echo "${HMAC_RESPONSE}" | jq -r '.data.hmac')
-echo "    HMAC: ${HMAC}"
-
-# Verify HMAC
-cmd "vault write ${MOUNT_PATH}/verify/user-pii \
-    input='${PAYLOAD_B64}' \
-    hmac='${HMAC}' \
-    algorithm=sha2-256"
-
-# =============================================================================
-# 7. Key rotation — new version created, old versions still decrypt
-# =============================================================================
-log "Step 7: Rotate encryption key (creates new key version)"
-cmd "vault write -f ${MOUNT_PATH}/keys/user-pii/rotate"
-cmd "vault read ${MOUNT_PATH}/keys/user-pii"
-
-# New encryptions use the latest key version automatically
-NEW_CIPHERTEXT=$(vault write -format=json ${MOUNT_PATH}/encrypt/user-pii \
-    plaintext="${PLAINTEXT_B64}" | jq -r '.data.ciphertext')
-echo "    New ciphertext (key v2): ${NEW_CIPHERTEXT}"
-
-# Old ciphertext still decrypts (key v1 still available)
-OLD_DECRYPTED=$(vault write -format=json ${MOUNT_PATH}/decrypt/user-pii \
-    ciphertext="${CIPHERTEXT}" | jq -r '.data.plaintext' | base64 -d)
-echo "    Old ciphertext still decrypts: ${OLD_DECRYPTED}"
-
-# =============================================================================
-# 8. Rewrap — re-encrypt old ciphertext with latest key version
-# =============================================================================
-log "Step 8: Rewrap old ciphertext to latest key version"
-REWRAP_RESPONSE=$(vault write -format=json ${MOUNT_PATH}/rewrap/user-pii \
-    ciphertext="${CIPHERTEXT}")
-REWRAPPED=$(echo "${REWRAP_RESPONSE}" | jq -r '.data.ciphertext')
-echo "    Original:  ${CIPHERTEXT}"
-echo "    Rewrapped: ${REWRAPPED}"
-echo "    (Rewrapped ciphertext uses latest key version — run rewrap job after each rotation)"
-
-# =============================================================================
-# 9. Set minimum decryption version (retire old key versions)
-# =============================================================================
-log "Step 9: Set minimum decryption version to retire key v1"
-cmd "vault write ${MOUNT_PATH}/keys/user-pii/config \
-    min_decryption_version=2 \
-    min_encryption_version=2"
-echo "    Key v1 ciphertext will now be rejected (must rewrap before retiring)"
-
-# =============================================================================
-# 10. Vault policy for application transit access (least-privilege)
-# =============================================================================
-log "Step 10: Create Vault policy for app transit encrypt/decrypt only"
-vault policy write app-transit-policy - <<'EOF'
-# Allow encrypting with user-pii key only
+log "Step 10: least-privilege policy for an application"
+vault policy write app-transit-policy - <<'POLICY'
+# encrypt, decrypt and HMAC with the user-pii key only; no key metadata, rotation or other keys
 path "transit/encrypt/user-pii" {
   capabilities = ["update"]
 }
-
-# Allow decrypting with user-pii key only
 path "transit/decrypt/user-pii" {
   capabilities = ["update"]
 }
-
-# Allow HMAC generation for integrity checks
 path "transit/hmac/user-pii" {
   capabilities = ["update"]
 }
+POLICY
 
-# No access to key metadata, rotation, or other keys
-EOF
-
-log "Transit encryption demo complete."
-log "Vault UI: ${VAULT_ADDR}/ui/vault/secrets/${MOUNT_PATH}/list"
+log "Transit demo complete. UI: ${VAULT_ADDR}/ui/vault/secrets/${MOUNT}/list"

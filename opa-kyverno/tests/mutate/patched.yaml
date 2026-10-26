@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: no-label
+  namespace: shop
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec: {containers: [{name: web, image: "nginx:1.27"}]}

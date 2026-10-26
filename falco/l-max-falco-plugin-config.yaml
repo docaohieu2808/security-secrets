@@ -1,135 +1,103 @@
 # =============================================================================
-# l-max-falco-plugin-config.yaml — Falco L-Max: Plugin framework configuration
+# l-max - Falco plugins: Kubernetes audit events as a second event source (Helm values)
 #
-# Falco plugins extend detection beyond syscalls to cloud APIs, K8s audit logs,
-# GitHub events, Okta logs, AWS CloudTrail, and more.
+# Falco is not only syscalls. A plugin turns another stream into events that rules can match: the
+# Kubernetes API-server audit log (k8saudit), AWS CloudTrail, GitHub webhooks, Okta... This file runs
+# Falco as a *Deployment* that only consumes k8s audit events (no kernel driver, no syscalls), next to
+# the DaemonSet from l1. It is the same shape as the chart's own values-k8saudit.yaml.
 #
-# Apply:
-#   kubectl create configmap falco-plugin-config \
-#     --from-file=falco.yaml=l-max-falco-plugin-config.yaml \
-#     --namespace falco --dry-run=client -o yaml | kubectl apply -f -
+#   helm upgrade --install falco-audit falcosecurity/falco --version 9.2.1 \
+#     --namespace falco --create-namespace -f l-max-falco-plugin-config.yaml
 #
-# Plugin registry: https://artifacthub.io/packages/search?kind=13
-# Install plugins: falcoctl artifact install <plugin-name>
+# Then point the API server at the webhook (kube-apiserver --audit-webhook-config-file, audit policy
+# file); the NodePort below is reachable from the control plane. The plugin and the default k8s audit
+# rules are fetched at startup by falcoctl (init container) and kept current by the follow sidecar.
+#
+# The old version of this file mixed Helm values with raw falco.yaml (a `falco:` wrapper plus
+# `syscall_event_source` and nested `webserver`), which is neither: use `falco.plugins` /
+# `falco.load_plugins`, `driver.enabled: false` and `falcoctl` as below.
 # =============================================================================
 
-# --- Plugin loading ----------------------------------------------------------
-# Plugins are shared libraries (.so) loaded at Falco startup.
-# Each plugin has an init_config (static) and open_params (per-source).
+# No syscalls from this release, so no driver and no container/k8s metadata collectors.
+driver:
+  enabled: false
+collectors:
+  enabled: false
 
-plugins:
-  # ---------------------------------------------------------------------------
-  # Plugin: k8saudit — Kubernetes Audit Log analysis
-  # Captures K8s API server audit events: RBAC changes, secret access, exec, etc.
-  # Requires K8s API server audit webhook pointing to Falco's port 9765
-  # ---------------------------------------------------------------------------
-  - name: k8saudit
-    library_path: libk8saudit.so
-    init_config:
-      sslCertificate: /etc/falco/certs/server.crt
-    open_params: "http://0.0.0.0:9765/k8s-audit"
+# One instance is enough for a webhook source; more replicas would each see a share of the events.
+controller:
+  kind: deployment
+  deployment:
+    replicas: 1
 
-  # ---------------------------------------------------------------------------
-  # Plugin: cloudtrail — AWS CloudTrail event analysis
-  # Detects: IAM abuse, S3 data exfil, EC2 security group changes, root login
-  # Reads from SQS queue that CloudTrail S3 notifications are sent to
-  # ---------------------------------------------------------------------------
-  - name: cloudtrail
-    library_path: libcloudtrail.so
-    init_config:
-      aws_region: "us-east-1"
-      # Use IAM role (IRSA on EKS) — avoid static credentials
-      # aws_access_key_id: ""     # Prefer IRSA / instance profile
-      # aws_secret_access_key: ""
-    open_params: "sqs://falco-cloudtrail-events"
+falcoctl:
+  artifact:
+    install:
+      enabled: true     # init container: download the plugin + rules before Falco starts
+    follow:
+      enabled: true     # sidecar: pull rule updates
+  config:
+    artifact:
+      install:
+        refs: [k8saudit-rules:0.16, k8saudit:0.16, json:0.7]
+      follow:
+        refs: [k8saudit-rules:0.16]
 
-  # ---------------------------------------------------------------------------
-  # Plugin: github — GitHub webhook event analysis
-  # Detects: secret exposure in commits, branch protection changes, force pushes
-  # Requires GitHub webhook sending events to Falco's HTTP endpoint
-  # ---------------------------------------------------------------------------
-  - name: github
-    library_path: libgithub.so
-    init_config:
-      secret: ""    # GitHub webhook secret — inject via K8s Secret
-    open_params: "http://0.0.0.0:9766/github"
+# The audit webhook target (kube-apiserver -> http://<node>:30007/k8s-audit)
+services:
+  - name: k8saudit-webhook
+    type: NodePort
+    ports:
+      - port: 9765          # matches open_params below
+        nodePort: 30007
+        protocol: TCP
 
-  # ---------------------------------------------------------------------------
-  # Plugin: okta — Okta Identity event analysis
-  # Detects: brute force, MFA bypass, suspicious logins, admin privilege abuse
-  # ---------------------------------------------------------------------------
-  - name: okta
-    library_path: libokta.so
-    init_config:
-      organization: "your-org.okta.com"
-      api_token: ""    # Inject via K8s Secret / Vault agent
-    open_params: ""
-
-  # ---------------------------------------------------------------------------
-  # Plugin: json — Generic JSON event parsing
-  # Enables Falco to process arbitrary JSON event streams
-  # ---------------------------------------------------------------------------
-  - name: json
-    library_path: libjson.so
-    init_config: ""
-    open_params: ""
-
-# --- Event sources -----------------------------------------------------------
-# Tell Falco which plugins to use as event sources (in addition to syscalls)
-load_plugins:
-  - k8saudit
-  - cloudtrail
-  - github
-  - okta
-  - json
-
-# --- K8s Audit specific rules ------------------------------------------------
-# These rules are loaded when k8saudit plugin is active
-# Place in /etc/falco/rules.d/k8saudit-custom.yaml
-
-# Example rules (inline for reference — move to rules.d in production):
-#
-# - rule: K8s Secret Accessed by Non-Controller
-#   desc: A secret was read by a non-system service account
-#   condition: >
-#     k8s_audit
-#     and ka.verb=get
-#     and ka.target.resource=secrets
-#     and not ka.user.name startswith "system:"
-#   output: >
-#     Secret accessed (user=%ka.user.name secret=%ka.target.name ns=%ka.target.namespace)
-#   priority: WARNING
-#   source: k8s_audit
-#   tags: [k8s, secret, mitre_credential_access]
-#
-# - rule: K8s RBAC ClusterRoleBinding Created
-#   desc: A new ClusterRoleBinding was created — may grant excessive permissions
-#   condition: >
-#     k8s_audit
-#     and ka.verb in (create, update)
-#     and ka.target.resource=clusterrolebindings
-#   output: >
-#     ClusterRoleBinding created/updated (user=%ka.user.name binding=%ka.target.name)
-#   priority: WARNING
-#   source: k8s_audit
-#   tags: [k8s, rbac, mitre_privilege_escalation]
-
-# --- Falco engine settings for plugin mode -----------------------------------
 falco:
-  # When using plugins as primary source, syscall capture can be disabled
-  # to reduce overhead. Set false only if you have syscall coverage elsewhere.
-  syscall_event_source:
-    enabled: true
+  rules_files:
+    - /etc/falco/k8s_audit_rules.yaml     # installed by falcoctl
+    - /etc/falco/rules.d                  # customRules below
+  plugins:
+    - name: k8saudit
+      library_path: libk8saudit.so
+      init_config: ""
+      open_params: "http://:9765/k8s-audit"
+    - name: json
+      library_path: libjson.so
+      init_config: ""
+    # More sources follow the same pattern; add the artifact to falcoctl refs and the entry here:
+    #   - name: cloudtrail
+    #     library_path: libcloudtrail.so
+    #     init_config: ""
+    #     open_params: "s3://my-cloudtrail-bucket/AWSLogs/"   # credentials from IRSA / instance profile, never inline
+    #   - name: github
+    #     library_path: libgithub.so
+    #     init_config: ""
+    #     open_params: "http://:9000/github"                  # webhook secret via Secret, not in values
+  load_plugins: [k8saudit, json]
+  json_output: true
 
-  # HTTP server for receiving plugin webhook events
-  webserver:
-    enabled: true
-    listen_port: 9765
-    k8s_audit_endpoint: /k8s-audit
-    k8s_healthz_endpoint: /healthz
-    ssl_enabled: false   # Enable with valid cert in production
+# Rules of our own on top of the stock k8s audit rules.
+customRules:
+  k8saudit-custom.yaml: |-
+    - required_engine_version: 0.57.0
 
-  # Output throttling — prevent alert floods from noisy sources
-  outputs:
-    rate: 100          # Max alerts per second before throttling
-    max_burst: 1000    # Burst allowance before throttle kicks in
+    - rule: Lab Secret Read by Non-System User
+      desc: A Secret was read through the API by an identity that is not a system component.
+      condition: >
+        ka.verb in (get, list) and ka.target.resource=secrets
+        and not ka.user.name startswith "system:"
+      output: >
+        Secret read (user=%ka.user.name verb=%ka.verb secret=%ka.target.name ns=%ka.target.namespace)
+      priority: WARNING
+      source: k8s_audit
+      tags: [k8s, secret, mitre_credential_access]
+
+    - rule: Lab ClusterRoleBinding Changed
+      desc: A ClusterRoleBinding was created or updated, which can grant wide permissions.
+      condition: >
+        ka.verb in (create, update, patch) and ka.target.resource=clusterrolebindings
+      output: >
+        ClusterRoleBinding changed (user=%ka.user.name verb=%ka.verb binding=%ka.target.name)
+      priority: WARNING
+      source: k8s_audit
+      tags: [k8s, rbac, mitre_privilege_escalation]

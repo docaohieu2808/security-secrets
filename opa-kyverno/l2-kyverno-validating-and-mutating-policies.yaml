@@ -1,0 +1,176 @@
+# =============================================================================
+# l2 - Kyverno: validate + mutate with the current CEL policy kinds (policies.kyverno.io/v1)
+#
+# Kyverno 1.17+ policies are CEL-based and split by purpose:
+#   ValidatingPolicy  - reject / warn / audit      (replaces ClusterPolicy validate rules)
+#   MutatingPolicy    - patch objects              (replaces ClusterPolicy mutate rules)
+#   GeneratingPolicy  - create companion resources (see l3; replaces generate rules)
+#   ImageValidatingPolicy, DeletingPolicy, PolicyException - the rest of the family
+#
+# The legacy kyverno.io/v1 ClusterPolicy / Policy kinds are deprecated since Kyverno 1.17 and are
+# removed in 1.20. Migrate with: kyverno migrate (or rewrite as below). This file is the CEL
+# equivalent of the old require-labels / add-label / imagePullPolicy ClusterPolicies.
+#
+# Install (pin the chart):
+#   helm repo add kyverno https://kyverno.github.io/kyverno/
+#   helm install kyverno kyverno/kyverno --version 3.9.2 --namespace kyverno --create-namespace
+# Test without a cluster:  kyverno test tests/
+# =============================================================================
+---
+# 1. Standard labels on Deployments. System namespaces are skipped with a namespaceSelector.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: require-standard-labels-on-deployments
+  annotations:
+    policies.kyverno.io/title: Require Standard Labels
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Deployments must carry the Kubernetes recommended labels plus a team label, which feed
+      service discovery, dashboards and cost allocation.
+spec:
+  validationActions: [Deny]
+  evaluation:
+    background:
+      enabled: true
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, kube-public, kube-node-lease, kyverno, gatekeeper-system, cert-manager]
+    resourceRules:
+      - apiGroups: [apps]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [deployments]
+  variables:
+    - name: required
+      expression: >-
+        ['app.kubernetes.io/name', 'app.kubernetes.io/version', 'app.kubernetes.io/component',
+         'app.kubernetes.io/managed-by', 'team']
+    - name: missing
+      expression: >-
+        variables.required.filter(l, !has(object.metadata.labels) || !(l in object.metadata.labels) || object.metadata.labels[l] == '')
+  validations:
+    - expression: size(variables.missing) == 0
+      messageExpression: "'Deployment is missing required labels: ' + variables.missing.join(', ')"
+---
+# 2. team + environment labels on Namespaces. matchConditions replaces the old `exclude` block.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: require-team-env-labels-on-namespaces
+  annotations:
+    policies.kyverno.io/title: Require Team and Environment Labels on Namespaces
+    policies.kyverno.io/category: Multi-tenancy
+    policies.kyverno.io/severity: medium
+spec:
+  validationActions: [Deny]
+  evaluation:
+    background:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [namespaces]
+  matchConditions:
+    - name: skip-system-namespaces
+      expression: >-
+        !(object.metadata.name in ['kube-system', 'kube-public', 'kube-node-lease', 'default',
+        'kyverno', 'gatekeeper-system', 'cert-manager', 'falco', 'local-path-storage'])
+  validations:
+    - expression: >-
+        has(object.metadata.labels) && 'team' in object.metadata.labels && object.metadata.labels['team'] != ''
+      message: "Namespace needs a non-empty 'team' label (for example team=platform)."
+    - expression: >-
+        has(object.metadata.labels) && 'environment' in object.metadata.labels &&
+        object.metadata.labels['environment'] in ['dev', 'staging', 'production']
+      message: "Namespace needs an 'environment' label: dev, staging or production."
+---
+# 3. Mutable tags must be re-pulled. Previously this policy only matched `*:latest` and never looked
+# at imagePullPolicy; it now checks both, and also catches images with no tag at all.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: require-imagepullpolicy-always-for-mutable-tags
+  annotations:
+    policies.kyverno.io/title: Require imagePullPolicy Always for Mutable Tags
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      A container whose image has no tag or the :latest tag (and no digest) must set
+      imagePullPolicy: Always, otherwise nodes keep serving a stale cached image.
+spec:
+  validationActions: [Deny]
+  evaluation:
+    background:
+      enabled: true
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, kyverno]
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+  variables:
+    - name: containers
+      expression: >-
+        object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+    - name: offenders
+      expression: >-
+        variables.containers.filter(c,
+          !c.image.contains('@sha256:') &&
+          (!c.image.split('/')[size(c.image.split('/')) - 1].contains(':') || c.image.endsWith(':latest')) &&
+          !(has(c.imagePullPolicy) && c.imagePullPolicy == 'Always'))
+  validations:
+    - expression: size(variables.offenders) == 0
+      messageExpression: >-
+        'Containers with a mutable image tag must set imagePullPolicy: Always: ' +
+        variables.offenders.map(c, c.name).join(', ')
+---
+# 4. MutatingPolicy: stamp a default managed-by label. matchConditions limits it to objects that are
+# missing the label, so an existing value is never overwritten (the old +(key) anchor).
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: add-managed-by-label-if-missing
+  annotations:
+    policies.kyverno.io/title: Add managed-by Label
+    policies.kyverno.io/category: Workload Management
+    policies.kyverno.io/severity: low
+spec:
+  evaluation:
+    mutateExisting:
+      enabled: false
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, kyverno]
+    resourceRules:
+      - apiGroups: [apps]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [deployments, statefulsets, daemonsets]
+  matchConditions:
+    - name: label-missing
+      expression: >-
+        !has(object.metadata.labels) || !('app.kubernetes.io/managed-by' in object.metadata.labels)
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          Object{
+            metadata: Object.metadata{
+              labels: {'app.kubernetes.io/managed-by': 'kubectl'}
+            }
+          }

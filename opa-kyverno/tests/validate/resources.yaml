@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: labelled
+  namespace: shop
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/version: "1.0"
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/managed-by: helm
+    team: payments
+spec:
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec: {containers: [{name: web, image: "nginx:1.27"}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unlabelled
+  namespace: shop
+  labels:
+    app.kubernetes.io/name: web
+spec:
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec: {containers: [{name: web, image: "nginx:1.27"}]}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: good-ns
+  labels: {team: payments, environment: production}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: no-team-ns
+  labels: {environment: production}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bad-env-ns
+  labels: {team: payments, environment: qa}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: pinned-tag, namespace: shop}
+spec:
+  containers: [{name: app, image: "nginx:1.27"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: latest-always, namespace: shop}
+spec:
+  containers: [{name: app, image: "nginx:latest", imagePullPolicy: Always}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: latest-ifnotpresent, namespace: shop}
+spec:
+  containers: [{name: app, image: "nginx:latest", imagePullPolicy: IfNotPresent}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: untagged, namespace: shop}
+spec:
+  containers: [{name: app, image: "nginx"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: registry-port-no-tag, namespace: shop}
+spec:
+  containers: [{name: app, image: "registry.example:5000/team/app"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: digest-pinned, namespace: shop}
+spec:
+  containers: [{name: app, image: "nginx@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]

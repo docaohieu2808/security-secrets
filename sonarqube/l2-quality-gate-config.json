@@ -1,19 +1,13 @@
 {
-  "_comment": "SonarQube Quality Gate configuration — import via API or sonar-project.properties",
+  "_comment": "SonarQube quality gate as data. Apply it with ./l2-apply-quality-gate.sh (it reads this file).",
   "_usage": [
-    "Create gate via API:",
-    "  TOKEN=<your-sonar-token>",
-    "  curl -X POST 'http://localhost:9000/api/qualitygates/create' \\",
-    "    -u $TOKEN: -d 'name=Production+Security+Gate'",
-    "",
-    "Then add each condition below using:",
-    "  curl -X POST 'http://localhost:9000/api/qualitygates/create_condition' \\",
-    "    -u $TOKEN: \\",
-    "    -d 'gateId=<gate-id>&metric=<metric>&op=<GT|LT>&error=<threshold>'",
-    "",
-    "Set as default gate:",
-    "  curl -X POST 'http://localhost:9000/api/qualitygates/set_as_default' \\",
-    "    -u $TOKEN: -d 'id=<gate-id>'"
+    "Create the gate:        POST /api/qualitygates/create            name=<gate name>",
+    "Add one condition:      POST /api/qualitygates/create_condition  gateName=<gate name> metric=<key> op=<GT|LT> error=<threshold>",
+    "Make it the default:    POST /api/qualitygates/set_as_default    name=<gate name>",
+    "Assign to one project:  POST /api/qualitygates/select            gateName=<gate name> projectKey=<project>",
+    "Parameter names changed: create_condition takes gateName (was gateId) and set_as_default takes name (was id).",
+    "Authenticate with an admin token as the basic-auth user: curl -u \"$SONAR_TOKEN:\" ...",
+    "Metric keys below are the classic ones; SonarQube 26.x defaults to Multi-Quality-rule mode and maps them (new_blocker_violations -> new_software_quality_blocker_issues) so both spellings work."
   ],
   "qualityGate": {
     "name": "Production Security Gate",
@@ -79,20 +73,5 @@
     "_desc": "Add these to sonar-project.properties or sonar-scanner CLI args",
     "sonar.qualitygate.wait": "true",
     "sonar.qualitygate.timeout": "300"
-  },
-  "securityHotspotCategories": {
-    "_desc": "OWASP Top 10 categories SonarQube checks by default",
-    "categories": [
-      "A1-Injection",
-      "A2-Broken_Authentication",
-      "A3-Sensitive_Data_Exposure",
-      "A4-XML_External_Entities",
-      "A5-Broken_Access_Control",
-      "A6-Security_Misconfiguration",
-      "A7-Cross_Site_Scripting",
-      "A8-Insecure_Deserialization",
-      "A9-Using_Components_With_Known_Vulnerabilities",
-      "A10-Insufficient_Logging_and_Monitoring"
-    ]
   }
 }

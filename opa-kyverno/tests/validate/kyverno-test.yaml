@@ -1,0 +1,15 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: validating-policies
+policies:
+  - ../../l2-kyverno-validating-and-mutating-policies.yaml
+resources:
+  - resources.yaml
+results:
+  - {policy: require-standard-labels-on-deployments, isValidatingPolicy: true, kind: Deployment, resources: [labelled], result: pass}
+  - {policy: require-standard-labels-on-deployments, isValidatingPolicy: true, kind: Deployment, resources: [unlabelled], result: fail}
+  - {policy: require-team-env-labels-on-namespaces, isValidatingPolicy: true, kind: Namespace, resources: [good-ns], result: pass}
+  - {policy: require-team-env-labels-on-namespaces, isValidatingPolicy: true, kind: Namespace, resources: [no-team-ns, bad-env-ns], result: fail}
+  - {policy: require-imagepullpolicy-always-for-mutable-tags, isValidatingPolicy: true, kind: Pod, resources: [pinned-tag, latest-always, digest-pinned], result: pass}
+  - {policy: require-imagepullpolicy-always-for-mutable-tags, isValidatingPolicy: true, kind: Pod, resources: [latest-ifnotpresent, untagged, registry-port-no-tag], result: fail}

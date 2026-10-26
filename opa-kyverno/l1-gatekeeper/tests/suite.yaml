@@ -1,0 +1,34 @@
+# Run: ./split.sh && gator verify .      (from this directory)
+kind: Suite
+apiVersion: test.gatekeeper.sh/v1alpha1
+tests:
+  - name: required-labels-on-workloads
+    template: generated/templates/k8srequiredlabels.yaml
+    constraint: generated/constraints/require-app-labels-on-workloads.yaml
+    cases:
+      - {name: labelled-deployment-passes, object: objects/deployment-good.yaml, assertions: [{violations: no}]}
+      - {name: unlabelled-deployment-fails, object: objects/deployment-no-labels.yaml, assertions: [{violations: 1}]}
+  - name: team-label-on-namespaces
+    template: generated/templates/k8srequiredlabels.yaml
+    constraint: generated/constraints/require-team-label-on-namespaces.yaml
+    cases:
+      - {name: labelled-namespace-passes, object: objects/namespace-good.yaml, assertions: [{violations: no}]}
+      - {name: namespace-without-team-fails, object: objects/namespace-no-team.yaml, assertions: [{violations: 1}]}
+  - name: deny-privileged
+    template: generated/templates/k8sdenyprivilegedcontainers.yaml
+    constraint: generated/constraints/deny-privileged-containers.yaml
+    cases:
+      - {name: normal-pod-passes, object: objects/pod-good.yaml, assertions: [{violations: no}]}
+      - {name: privileged-init-container-fails, object: objects/pod-privileged.yaml, assertions: [{violations: 1}]}
+  - name: resource-limits
+    template: generated/templates/k8srequireresourcelimits.yaml
+    constraint: generated/constraints/require-resource-limits.yaml
+    cases:
+      - {name: limited-pod-passes, object: objects/pod-good.yaml, assertions: [{violations: no}]}
+      - {name: missing-memory-limit-fails, object: objects/pod-no-limits.yaml, assertions: [{violations: 1}]}
+  - name: allowed-registries
+    template: generated/templates/k8sallowedregistries.yaml
+    constraint: generated/constraints/restrict-images-to-approved-registries.yaml
+    cases:
+      - {name: approved-registry-passes, object: objects/pod-good.yaml, assertions: [{violations: no}]}
+      - {name: unapproved-registry-fails, object: objects/pod-bad-registry.yaml, assertions: [{violations: 1}]}

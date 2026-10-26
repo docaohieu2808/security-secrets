@@ -1,0 +1,140 @@
+# =============================================================================
+# l4 - External Secrets without any cloud: the `kubernetes` and `fake` providers
+#
+# The Vault/AWS/GCP stores in l2/l3 need real backends. These two run on any cluster, which makes them
+# the way to learn the ESO flow (store -> ExternalSecret -> synced Secret) and the way CI proves it:
+#
+#   fake        static key/values written in the store itself (testing only)
+#   kubernetes  reads Secrets from another namespace, authenticating as a ServiceAccount
+#
+#   kubectl apply -f l4-kubernetes-provider-demo.yaml
+#   kubectl -n eso-demo get externalsecret,secretstore
+#   kubectl -n eso-demo get secret from-kubernetes-store -o jsonpath='{.data.password}' | base64 -d
+# =============================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eso-source
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eso-demo
+---
+# The "remote" secret lives in eso-source, as if it were in another cluster's namespace.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-credentials
+  namespace: eso-source
+stringData:
+  username: app
+  password: demo-password-not-real
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eso-store
+  namespace: eso-demo
+---
+# The store's identity needs read access to the source namespace, plus SelfSubjectRulesReview so ESO
+# can validate the store.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eso-store-reader
+  namespace: eso-source
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [authorization.k8s.io]
+    resources: [selfsubjectrulesreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eso-store-reader
+  namespace: eso-source
+subjects:
+  - kind: ServiceAccount
+    name: eso-store
+    namespace: eso-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eso-store-reader
+---
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: k8s-store
+  namespace: eso-demo
+spec:
+  provider:
+    kubernetes:
+      remoteNamespace: eso-source
+      server:
+        # url omitted: defaults to the in-cluster API server
+        caProvider:
+          type: ConfigMap
+          name: kube-root-ca.crt    # exists in every namespace
+          key: ca.crt
+      auth:
+        serviceAccount:
+          name: eso-store
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: from-kubernetes-store
+  namespace: eso-demo
+spec:
+  refreshInterval: 1m
+  secretStoreRef:
+    name: k8s-store
+    kind: SecretStore
+  target:
+    name: from-kubernetes-store
+    creationPolicy: Owner
+  data:
+    - secretKey: username
+      remoteRef: {key: database-credentials, property: username}
+    - secretKey: password
+      remoteRef: {key: database-credentials, property: password}
+---
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: fake-store
+  namespace: eso-demo
+spec:
+  provider:
+    fake:
+      data:
+        - key: /demo/api
+          value: '{"token": "fake-token-not-real", "region": "ap-southeast-1"}'
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: from-fake-store
+  namespace: eso-demo
+spec:
+  refreshInterval: 1m
+  secretStoreRef:
+    name: fake-store
+    kind: SecretStore
+  target:
+    name: from-fake-store
+    creationPolicy: Owner
+    template:
+      # templating: add a derived key and keep the extracted ones (default policy Replace would drop them)
+      mergePolicy: Merge
+      data:
+        endpoint: "https://api.{{ .region }}.example.internal"
+  dataFrom:
+    - extract:
+        key: /demo/api

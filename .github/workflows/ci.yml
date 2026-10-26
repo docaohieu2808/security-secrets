@@ -1,0 +1,362 @@
+# Proves every level in this repo does what the README says, on every push and once a week (so a new tool or chart
+# release that breaks a lab shows up here first).
+#
+#   lint        shellcheck (all scripts), actionlint, yamllint, action pinning
+#   rego        opa check --strict + opa test (Rego library, conftest policy, Trivy custom checks); conftest on pass/fail fixtures
+#   policy-cli  gator verify (Gatekeeper) and kyverno test (ValidatingPolicy / MutatingPolicy)
+#   schemas     helm template + kubeconform -strict against CRD schemas built from the operators' own CRDs;
+#               every values file checked for keys its chart does not define
+#   falco       falco --validate on the custom rules and the k8s audit rules (no kernel driver needed)
+#   eso         kind: External Secrets Operator syncs a Secret through the kubernetes and fake providers
+#   sealed      kind: Sealed Secrets controller seals and unseals; strict vs namespace-wide scope; re-encrypt
+#   kyverno     kind: Kyverno blocks a bad pod / namespace / deployment, admits good ones, mutates, generates
+#   sops        age round trip, per-environment keys, rotation (no cloud: the GCP KMS level is shellchecked only)
+#   vault       Vault dev server + OpenBao: KV v2, dynamic PostgreSQL credentials, PKI, Transit
+#   trivy       pinned install with checksum, image scan fails on a vulnerable image, IaC scan, custom checks, SBOM
+#   sonarqube   Community Build + PostgreSQL: quality gate import, clean project passes, bad project fails
+#
+# Not runnable on a hosted runner (needs a cloud account or a kernel driver): sops/l2 (GCP KMS), the live Falco
+# driver, the Vault Agent injector manifests (schema-checked only), AWS/GCP SecretStores (schema-checked only).
+name: ci
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 20 * * 0"      # Sunday 20:17 UTC = Monday 03:17 Asia/Saigon
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  K8S_VERSION: "1.34.0"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: git ls-files '*.sh' | xargs shellcheck -x
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          bash <(curl -sSfL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
+          ./actionlint -color
+      - name: yamllint
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet -r scripts/requirements.txt
+          .venv/bin/yamllint -c .yamllint.yml --strict .
+      - name: Every action is pinned to a commit SHA that exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          refs=$(grep -rhE '^[[:space:]]*(- )?uses: *[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@' .github \
+            | sed -E 's/^[[:space:]]*(- )?uses: *//; s/[[:space:]].*$//' | sort -u)
+          status=0
+          while IFS=@ read -r ref sha; do
+            repo=$(echo "$ref" | cut -d/ -f1-2)
+            if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "FAIL $ref@$sha is not pinned to a SHA"; status=1
+            elif gh api "repos/$repo/commits/$sha" --jq .sha >/dev/null 2>&1; then echo "ok   $ref@$sha"
+            else echo "FAIL $ref@$sha is not a commit"; status=1; fi
+          done <<< "$refs"
+          exit "$status"
+
+  rego:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/install-tools.sh opa conftest
+      - name: opa check --strict
+        run: opa check --strict opa-kyverno/rego opa-kyverno/policy trivy/l-max-custom-checks
+      - name: opa fmt
+        run: opa fmt --diff --fail opa-kyverno/rego opa-kyverno/policy trivy/l-max-custom-checks
+      - name: opa test
+        run: |
+          opa test opa-kyverno/rego opa-kyverno/policy -v
+          opa test trivy/l-max-custom-checks -v
+      - name: conftest passes the good fixtures
+        run: conftest test opa-kyverno/fixtures/good --policy opa-kyverno/policy --policy opa-kyverno/rego/lib
+      - name: conftest fails the bad fixtures, with exactly the expected denies
+        run: |
+          rc=0
+          conftest test opa-kyverno/fixtures/bad --policy opa-kyverno/policy --policy opa-kyverno/rego/lib --output json > bad.json || rc=$?
+          test "$rc" -eq 1 || { echo "expected exit 1, got $rc"; exit 1; }
+          test "$(jq '[.[].failures | length] | add' bad.json)" -eq 5
+
+  policy-cli:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/install-tools.sh gator kyverno
+      - name: gator verify (Gatekeeper templates + constraints, pass and fail cases)
+        run: |
+          cd opa-kyverno/l1-gatekeeper/tests
+          ./split.sh
+          gator verify . -v
+      - name: kyverno test (ValidatingPolicy, MutatingPolicy)
+        run: kyverno test opa-kyverno/tests/validate opa-kyverno/tests/mutate
+      - name: kyverno test must fail when a policy is wrong
+        run: |
+          # flip one expectation in a copy: the CLI has to notice
+          cp -r opa-kyverno /tmp/kyverno-copy
+          sed -i 's/resources: \[unlabelled\], result: fail/resources: [unlabelled], result: pass/' /tmp/kyverno-copy/tests/validate/kyverno-test.yaml
+          if kyverno test /tmp/kyverno-copy/tests/validate >/dev/null 2>&1; then echo "kyverno test accepted a wrong expectation"; exit 1; fi
+
+  schemas:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+      - run: scripts/install-tools.sh kubeconform
+      - name: Python deps
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet -r scripts/requirements.txt
+      - name: Helm repos
+        run: |
+          helm repo add external-secrets https://charts.external-secrets.io
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo add sealed-secrets https://bitnami.github.io/sealed-secrets
+          helm repo add gatekeeper https://open-policy-agent.github.io/gatekeeper/charts
+          helm repo update
+      - name: Every values file only sets keys its chart defines
+        run: |
+          mkdir -p work
+          helm show values external-secrets/external-secrets --version 2.14.0 > work/eso-defaults.yaml
+          helm show values falcosecurity/falco --version 9.2.1 > work/falco-defaults.yaml
+          helm show values sealed-secrets/sealed-secrets --version 2.20.0 > work/ss-defaults.yaml
+          .venv/bin/python scripts/check-values-keys.py work/eso-defaults.yaml external-secrets/l1-install-operator.yaml
+          .venv/bin/python scripts/check-values-keys.py work/falco-defaults.yaml falco/l1-install-helm-values.yaml --allow falcosidekick.config --allow falcosidekick.webui
+          .venv/bin/python scripts/check-values-keys.py work/falco-defaults.yaml falco/l-max-falco-plugin-config.yaml
+          .venv/bin/python scripts/check-values-keys.py work/ss-defaults.yaml sealed-secrets/l1-install-controller.yaml
+      - name: The check catches the old, broken values (negative control)
+        run: |
+          printf 'securityContext: {runAsUser: 1}\nacceptancepolicy: x\n' > work/bad-ss-values.yaml
+          if .venv/bin/python scripts/check-values-keys.py work/ss-defaults.yaml work/bad-ss-values.yaml; then echo "unknown keys not detected"; exit 1; fi
+          printf 'driver: {kind: ebpf, ebpf: {}}\nfalco: {grpc: {enabled: true}}\n' > work/bad-falco-values.yaml
+          if .venv/bin/python scripts/check-values-keys.py work/falco-defaults.yaml work/bad-falco-values.yaml; then echo "unknown keys not detected"; exit 1; fi
+      - name: helm template (the charts must accept our values)
+        run: |
+          mkdir -p work/render
+          helm template external-secrets external-secrets/external-secrets --version 2.14.0 -n external-secrets --include-crds -f external-secrets/l1-install-operator.yaml > work/render/eso.yaml
+          helm template falco falcosecurity/falco --version 9.2.1 -n falco -f falco/l1-install-helm-values.yaml --set-file 'customRules.custom-rules\.yaml=falco/l2-custom-rules.yaml' > work/render/falco.yaml
+          helm template falco-audit falcosecurity/falco --version 9.2.1 -n falco -f falco/l-max-falco-plugin-config.yaml > work/render/falco-audit.yaml
+          helm template sealed-secrets sealed-secrets/sealed-secrets --version 2.20.0 -n kube-system --include-crds -f sealed-secrets/l1-install-controller.yaml > work/render/sealed-secrets.yaml
+          helm template gatekeeper gatekeeper/gatekeeper --version 3.23.1 -n gatekeeper-system --include-crds > work/render/gatekeeper.yaml
+      - name: Rendered output carries our settings (Helm ignores what it does not know)
+        run: |
+          grep -q 'kind: modern_ebpf' work/render/falco.yaml
+          ! grep -qE 'grpc|legacy' work/render/falco.yaml || { echo "legacy/grpc settings still rendered"; exit 1; }
+          grep -q 'image: docker.io/bitnami/sealed-secrets-controller:0.40.0' work/render/sealed-secrets.yaml
+          grep -q -- '--key-renew-period' work/render/sealed-secrets.yaml
+          grep -q 'name: sealed-secrets-controller' work/render/sealed-secrets.yaml
+          grep -qE '^  replicas: 2$' work/render/eso.yaml
+      - name: CRD schemas (from the operators' own CRDs, strict)
+        run: |
+          mkdir -p work/crds
+          for kind in validatingpolicies mutatingpolicies generatingpolicies; do
+            curl -fsSL "https://raw.githubusercontent.com/kyverno/kyverno/v1.19.2/config/crds/policies.kyverno.io/policies.kyverno.io_${kind}.yaml" -o "work/crds/kyverno-${kind}.yaml"
+          done
+          .venv/bin/python scripts/crds-to-kubeconform-schemas.py work/schemas work/render/eso.yaml work/render/sealed-secrets.yaml work/render/gatekeeper.yaml work/crds/*.yaml
+      - name: kubeconform -strict on the manifests
+        run: |
+          KC="kubeconform -strict -summary -kubernetes-version ${K8S_VERSION} -schema-location default -schema-location work/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
+          # constraints are instances of the CRDs that ConstraintTemplates create at runtime; gator tests those
+          $KC -skip K8sRequiredLabels,K8sDenyPrivilegedContainers,K8sRequireResourceLimits,K8sAllowedRegistries \
+            external-secrets/l2-secretstore-vault.yaml external-secrets/l3-externalsecret-sync.yaml external-secrets/l4-kubernetes-provider-demo.yaml \
+            opa-kyverno/l1-gatekeeper/templates.yaml opa-kyverno/l1-gatekeeper/constraints.yaml \
+            opa-kyverno/l2-kyverno-validating-and-mutating-policies.yaml opa-kyverno/l3-kyverno-generating-policies.yaml \
+            vault/l-max-vault-agent-sidecar.yaml
+      - name: kubeconform -strict on the rendered charts
+        run: |
+          kubeconform -strict -summary -skip CustomResourceDefinition -kubernetes-version "${K8S_VERSION}" -schema-location default \
+            -schema-location 'work/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            work/render/eso.yaml work/render/falco.yaml work/render/falco-audit.yaml work/render/sealed-secrets.yaml
+      - name: Negative controls (a stale API version and a typo must fail)
+        run: |
+          sed 's#external-secrets.io/v1$#external-secrets.io/v1beta1#' external-secrets/l4-kubernetes-provider-demo.yaml > work/old-api.yaml
+          printf 'apiVersion: external-secrets.io/v1\nkind: ExternalSecret\nmetadata: {name: x, namespace: y}\nspec:\n  refreshIntervall: 1h\n  secretStoreRef: {name: a, kind: SecretStore}\n' > work/typo.yaml
+          for f in work/old-api.yaml work/typo.yaml; do
+            if kubeconform -strict -kubernetes-version "${K8S_VERSION}" -schema-location default -schema-location 'work/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' "$f" >/dev/null 2>&1; then
+              echo "kubeconform accepted $f"; exit 1
+            fi
+          done
+
+  falco:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: falco/tests/validate-rules.sh
+
+  eso:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          cluster_name: eso
+      - run: external-secrets/tests/kind-eso.sh
+
+  sealed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          cluster_name: sealed
+      - run: scripts/install-tools.sh kubeseal
+      - run: sealed-secrets/tests/kind-sealed.sh
+
+  kyverno:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          cluster_name: kyverno
+      - run: opa-kyverno/tests/kind-kyverno.sh
+
+  sops:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get install -y --no-install-recommends age
+      - run: scripts/install-tools.sh sops
+      - run: sops/tests/e2e.sh
+
+  vault:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [vault, openbao]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Vault dev server + PostgreSQL (compose file from l1)
+        if: matrix.server == 'vault'
+        run: |
+          docker compose -f vault/l1-dev-server-docker-compose.yml --profile db up -d --wait
+          mkdir -p "$HOME/.local/bin"
+          cid=$(docker create hashicorp/vault:2.2.1)
+          docker cp "$cid:/bin/vault" "$HOME/.local/bin/vault"
+          docker rm "$cid"
+      - name: OpenBao dev server + PostgreSQL (same scripts, `bao` installed as `vault`)
+        if: matrix.server == 'openbao'
+        run: |
+          docker network create labnet
+          docker run -d --name postgres --network labnet -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=myapp \
+            -p 127.0.0.1:15432:5432 -v "$PWD/vault/l3-seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro" postgres:17-alpine
+          docker run -d --name openbao --network labnet --cap-add IPC_LOCK -p 127.0.0.1:8200:8200 \
+            -e BAO_DEV_ROOT_TOKEN_ID=dev-root-token -e BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200 openbao/openbao:2.7.1 server -dev
+          mkdir -p "$HOME/.local/bin"
+          cid=$(docker create openbao/openbao:2.7.1)
+          docker cp "$cid:/bin/bao" "$HOME/.local/bin/vault"
+          docker rm "$cid"
+          for _ in $(seq 1 30); do docker exec postgres pg_isready -U postgres -d myapp && break; sleep 1; done
+      - name: Labs l2 to l5
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: dev-root-token
+          DB_CHECK_PORT: "15432"
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          vault version
+          vault/tests/e2e.sh
+      - name: Logs on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker ps -aq | xargs -r -n1 docker logs --tail 40
+      - name: Tear down (Vault)
+        if: always() && matrix.server == 'vault'
+        run: docker compose -f vault/l1-dev-server-docker-compose.yml --profile db down -v
+      - name: Tear down (OpenBao)
+        if: always() && matrix.server == 'openbao'
+        run: |
+          docker rm -f openbao postgres
+          docker network rm labnet
+
+  trivy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: trivy/install-trivy.sh "$HOME/.local/bin"
+      - run: trivy/tests/e2e.sh
+
+  sonarqube:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Elasticsearch inside SonarQube needs these
+        run: sudo sysctl -w vm.max_map_count=524288 fs.file-max=131072
+      - name: Start SonarQube Community Build + PostgreSQL
+        run: docker compose -f sonarqube/l1-docker-compose-sonarqube.yml up -d --wait --wait-timeout 420
+      - name: Labs l1 to l3 end to end
+        run: |
+          SONAR_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+          echo "::add-mask::$SONAR_ADMIN_PASSWORD"
+          export SONAR_ADMIN_PASSWORD
+          sonarqube/tests/e2e.sh
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f sonarqube/l1-docker-compose-sonarqube.yml logs --tail=60
+      - name: Tear down
+        if: always()
+        run: docker compose -f sonarqube/l1-docker-compose-sonarqube.yml down -v

@@ -11,9 +11,13 @@
 # Install:
 #   helm repo add external-secrets https://charts.external-secrets.io
 #   helm repo update
-#   helm install external-secrets external-secrets/external-secrets \
+#   helm install external-secrets external-secrets/external-secrets --version 2.14.0 \
 #     --namespace external-secrets --create-namespace \
 #     --values l1-install-operator.yaml
+#
+# Chart 2.x serves external-secrets.io/v1 only: v1beta1 is not served any more (the escape hatch
+# crds.unsafeServeV1Beta1 is scheduled for removal), so every manifest in this directory uses v1.
+# PushSecret and the generators are still v1alpha1.
 #
 # Verify:
 #   kubectl get pods -n external-secrets
@@ -41,17 +45,20 @@ resources:
     memory: 128Mi
 
 # --- Security context --------------------------------------------------------
+# The chart already ships a restricted securityContext (non-root, read-only rootfs, drop ALL,
+# RuntimeDefault seccomp); these blocks only make the intent explicit.
 podSecurityContext:
-  runAsNonRoot: true
-  seccompProfile:
-    type: RuntimeDefault
+  enabled: true
 
 securityContext:
+  enabled: true
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
   capabilities:
     drop: [ALL]
   runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
 
 # --- Service account ---------------------------------------------------------
 serviceAccount:
@@ -74,11 +81,6 @@ webhook:
     limits:
       cpu: 50m
       memory: 64Mi
-  securityContext:
-    allowPrivilegeEscalation: false
-    readOnlyRootFilesystem: true
-    capabilities:
-      drop: [ALL]
 
 # --- Cert Controller (manages webhook TLS certs) ----------------------------
 certController:
@@ -90,14 +92,6 @@ certController:
     limits:
       cpu: 50m
       memory: 64Mi
-
-# --- Reconcile interval ------------------------------------------------------
-# How often ESO polls the external provider for secret changes
-# Override per ExternalSecret with spec.refreshInterval
-# Global default:
-extraArgs:
-  metrics-addr: ":8080"
-  # polling-interval is set per ExternalSecret — no global override needed
 
 # --- Metrics -----------------------------------------------------------------
 metrics:
@@ -114,6 +108,8 @@ rbac:
 
 # --- CRDs -------------------------------------------------------------------
 installCRDs: true    # Let Helm manage CRDs (simpler upgrades)
+crds:
+  unsafeServeV1Beta1: false    # keep false: v1beta1 is deprecated and the flag is going away
 
 # --- Node placement ----------------------------------------------------------
 nodeSelector: {}

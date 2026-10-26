@@ -1,43 +1,34 @@
 # =============================================================================
-# l1-docker-compose-sonarqube.yml — SonarQube: Local dev stack via Docker Compose
+# l1 - SonarQube Community Build + PostgreSQL via Docker Compose
 #
-# Starts SonarQube Community Edition + PostgreSQL for local SAST development.
+# SonarQube moved from "10.x LTS" tags to year/month versions: the Community Build is now
+# 26.10 (tag 26.10.0.133078-community). The old `sonarqube:10-community` tag stopped at 2024
+# and no longer gets fixes. Pin the full tag; `community` floats to the newest build.
 #
-# Usage:
-#   # Increase vm.max_map_count required by Elasticsearch inside SonarQube
+# Host prerequisites (Elasticsearch inside SonarQube refuses to start without them):
 #   sudo sysctl -w vm.max_map_count=524288
 #   sudo sysctl -w fs.file-max=131072
 #
-#   docker compose -f l1-docker-compose-sonarqube.yml up -d
+#   docker compose -f l1-docker-compose-sonarqube.yml up -d --wait     # ~2 minutes
+#   ./l1-bootstrap.sh                                                  # change admin/admin, print an analysis token
 #
-# Access:
-#   http://localhost:9000
-#   Default credentials: admin / admin  (change immediately on first login)
-#
-# Upgrade:
-#   docker compose -f l1-docker-compose-sonarqube.yml pull
-#   docker compose -f l1-docker-compose-sonarqube.yml up -d
+# The UI/API listen on 127.0.0.1 only. Put a reverse proxy with TLS in front before exposing it.
+# Override the database password: SONAR_DB_PASSWORD=... docker compose ... up -d
 # =============================================================================
-
-version: "3.8"
+name: sonarqube-lab
 
 services:
-  # ---------------------------------------------------------------------------
-  # PostgreSQL — SonarQube metadata database
-  # ---------------------------------------------------------------------------
   sonarqube-db:
-    image: postgres:15-alpine
-    container_name: sonarqube-db
+    image: postgres:17-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: sonar
-      POSTGRES_PASSWORD: sonar_password       # Change in production
+      POSTGRES_PASSWORD: ${SONAR_DB_PASSWORD:-sonar_password}   # dev default; override outside a laptop
       POSTGRES_DB: sonarqube
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - sonarqube_db_data:/var/lib/postgresql/data
-    networks:
-      - sonarqube-net
+    networks: [sonarqube-net]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sonar -d sonarqube"]
       interval: 10s
@@ -45,77 +36,42 @@ services:
       retries: 5
       start_period: 20s
 
-  # ---------------------------------------------------------------------------
-  # SonarQube Community Edition
-  # For production, use sonarqube:enterprise or sonarqube:developer
-  # ---------------------------------------------------------------------------
   sonarqube:
-    image: sonarqube:10-community
-    container_name: sonarqube
+    image: sonarqube:26.10.0.133078-community
     restart: unless-stopped
     depends_on:
       sonarqube-db:
         condition: service_healthy
     environment:
-      # Database connection
       SONAR_JDBC_URL: jdbc:postgresql://sonarqube-db:5432/sonarqube
       SONAR_JDBC_USERNAME: sonar
-      SONAR_JDBC_PASSWORD: sonar_password     # Match POSTGRES_PASSWORD above
-
-      # JVM heap tuning — increase for large codebases
-      SONAR_CE_JAVAOPTS: "-Xmx2g -Xms512m"
+      SONAR_JDBC_PASSWORD: ${SONAR_DB_PASSWORD:-sonar_password}
+      # JVM heap per process: web server, compute engine, Elasticsearch
       SONAR_WEB_JAVAOPTS: "-Xmx1g -Xms256m"
-
-      # Web context path (keep / for local, set /sonarqube for reverse proxy)
-      SONAR_WEB_CONTEXT: /
-
-      # Enable LDAP/SAML SSO in production by adding:
-      # SONAR_SECURITY_REALM: LDAP
-      # LDAP_URL: ldap://ldap-server:389
-
+      SONAR_CE_JAVAOPTS: "-Xmx2g -Xms512m"
+      SONAR_SEARCH_JAVAOPTS: "-Xmx1g -Xms1g"
     ports:
-      - "9000:9000"     # SonarQube web UI
-      - "9092:9092"     # SonarQube compute engine (internal, expose only if needed)
-
+      - "127.0.0.1:9000:9000"       # web UI + API. Nothing else needs publishing.
     volumes:
       - sonarqube_data:/opt/sonarqube/data
       - sonarqube_logs:/opt/sonarqube/logs
       - sonarqube_extensions:/opt/sonarqube/extensions
-      - sonarqube_conf:/opt/sonarqube/conf
-
-    networks:
-      - sonarqube-net
-
-    # Required: SonarQube uses Elasticsearch internally which needs higher ulimits
+    networks: [sonarqube-net]
     ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
-      nproc:
-        soft: 4096
-        hard: 4096
-
+      nofile: {soft: 131072, hard: 131072}
+      nproc: {soft: 8192, hard: 8192}
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9000/api/system/status | grep -q '\"status\":\"UP\"'"]
-      interval: 30s
+      interval: 15s
       timeout: 10s
-      retries: 10
-      start_period: 120s    # SonarQube takes ~2 minutes to fully start
+      retries: 30
+      start_period: 90s
 
-# --- Volumes -----------------------------------------------------------------
 volumes:
   sonarqube_db_data:
-    driver: local
   sonarqube_data:
-    driver: local
   sonarqube_logs:
-    driver: local
   sonarqube_extensions:
-    driver: local
-  sonarqube_conf:
-    driver: local
 
-# --- Networks ----------------------------------------------------------------
 networks:
   sonarqube-net:
-    driver: bridge

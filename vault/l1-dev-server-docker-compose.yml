@@ -1,95 +1,62 @@
 # =============================================================================
-# l1-dev-server-docker-compose.yml — Vault: Local dev server via Docker Compose
+# l1 - Vault dev server via Docker Compose
 #
-# Starts HashiCorp Vault in dev mode — single-node, in-memory, auto-unsealed.
-# DEV MODE ONLY: all data lost on restart. Never use dev mode in production.
+# Dev mode = one node, in-memory storage, auto-unsealed, root token chosen by you, HTTP not HTTPS.
+# EVERYTHING IS LOST ON RESTART and the root token is a known string: for learning only.
 #
-# Usage:
-#   docker compose -f l1-dev-server-docker-compose.yml up -d
-#   export VAULT_ADDR=http://127.0.0.1:8200
-#   export VAULT_TOKEN=dev-root-token
+#   docker compose -f l1-dev-server-docker-compose.yml up -d --wait
+#   export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=dev-root-token
 #   vault status
 #
-# For production, use integrated storage (Raft) or Consul backend with TLS.
-# Production Helm install:
-#   helm repo add hashicorp https://helm.releases.hashicorp.com
-#   helm install vault hashicorp/vault --namespace vault --create-namespace \
-#     --set "server.ha.enabled=true" --set "server.ha.raft.enabled=true"
+# The port is published on 127.0.0.1 only. The dev listener inside the container is 0.0.0.0 (it has to be,
+# for the published port to work), so the loopback binding on the host is what keeps a known root token away
+# from the network. Do NOT change it to "8200:8200" on a shared machine.
+#
+# Version / licence: hashicorp/vault 2.2.1 (current, Oct 2026). Every 1.x line is end of life now (1.21 ended
+# in April 2026; 1.17, the tag this file used before, ended in October 2024).
+# Vault has been under the Business Source License 1.1 since 1.15 (HashiCorp, now IBM): free to use, not
+# open source. OpenBao (Linux Foundation, MPL-2.0) is the open-source fork of Vault 1.14; swap the image for
+# `openbao/openbao:2.7.1` and the `vault` CLI for `bao` to try it. Everything in this directory is plain Vault
+# HTTP API, which OpenBao serves.
+#
+# Production is a different animal: integrated storage (Raft), TLS, auto-unseal, audit devices. See the README.
 # =============================================================================
-
-version: "3.8"
+name: vault-dev
 
 services:
   vault:
-    image: hashicorp/vault:1.17
-    container_name: vault-dev
+    image: hashicorp/vault:2.2.1
     restart: unless-stopped
-
-    # Dev server flags:
-    #   -dev              : enable dev mode (in-memory, auto-unseal)
-    #   -dev-root-token-id: set a predictable root token for local scripting
-    #   -dev-listen-address: bind to all interfaces so host can reach it
-    command: >
-      vault server
-        -dev
-        -dev-root-token-id=dev-root-token
-        -dev-listen-address=0.0.0.0:8200
-
-    ports:
-      - "8200:8200"     # Vault API and UI
-
+    command: ["server", "-dev"]
     environment:
-      # Disable TLS for dev mode (required when -dev-listen-address is used)
-      VAULT_DEV_ROOT_TOKEN_ID: dev-root-token
-      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:-dev-root-token}
       VAULT_ADDR: http://127.0.0.1:8200
-      # Enable Vault UI
-      VAULT_UI: "true"
-
+    ports:
+      - "127.0.0.1:8200:8200"      # API and UI, loopback only
     cap_add:
-      # IPC_LOCK prevents Vault memory from being swapped to disk
-      # Critical in production to protect secrets from appearing in swap
-      - IPC_LOCK
-
-    volumes:
-      # Persist logs even in dev mode (optional)
-      - vault_logs:/vault/logs
-      # Mount config dir for any extra HCL config overrides
-      - vault_config:/vault/config
-
+      - IPC_LOCK                    # keeps secrets out of swap; Vault refuses to start without it unless disable_mlock is set
     healthcheck:
-      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
-      interval: 10s
+      test: ["CMD", "vault", "status"]
+      interval: 5s
       timeout: 5s
-      retries: 5
-      start_period: 10s
+      retries: 10
+      start_period: 5s
 
-  # ---------------------------------------------------------------------------
-  # Vault Agent — demonstrates auto-auth and template rendering locally
-  # Comment out if not needed for basic dev usage
-  # ---------------------------------------------------------------------------
-  vault-agent:
-    image: hashicorp/vault:1.17
-    container_name: vault-agent-dev
-    restart: unless-stopped
-    depends_on:
-      vault:
-        condition: service_healthy
-    command: >
-      vault agent -config=/vault/config/agent.hcl
+  # PostgreSQL for l3 (dynamic database credentials). Not started by default:
+  #   docker compose -f l1-dev-server-docker-compose.yml --profile db up -d --wait
+  # Vault (in its own container) reaches it as host `postgres`; the published port is for your psql only.
+  postgres:
+    image: postgres:17-alpine
+    profiles: [db]
     environment:
-      VAULT_ADDR: http://vault:8200
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}      # dev default; l3 can rotate it away from you
+      POSTGRES_DB: myapp
+    ports:
+      - "127.0.0.1:${POSTGRES_PUBLISH_PORT:-15432}:5432"
     volumes:
-      - ./agent-config:/vault/config:ro
-      - vault_agent_sink:/vault/sink
-    profiles:
-      # Only start with: docker compose --profile agent up
-      - agent
-
-volumes:
-  vault_logs:
-    driver: local
-  vault_config:
-    driver: local
-  vault_agent_sink:
-    driver: local
+      - ./l3-seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d myapp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

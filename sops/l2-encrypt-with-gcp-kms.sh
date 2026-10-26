@@ -1,128 +1,92 @@
 #!/usr/bin/env bash
 # =============================================================================
-# l2-encrypt-with-gcp-kms.sh — SOPS: Encrypt secrets using GCP KMS key
+# l2 - SOPS + GCP KMS: no private key file to guard, IAM decides who can decrypt
 #
-# Uses Google Cloud KMS as the key provider instead of age.
-# Advantages over age:
-#   - No private key to manage — GCP IAM controls access
-#   - Full audit trail in Cloud Audit Logs
-#   - Key rotation handled by GCP
-#   - Works with Workload Identity (no SA key files in CI)
+# Compared with age:
+#   - the data key is wrapped by a key that never leaves Cloud KMS; access is an IAM binding
+#   - every encrypt/decrypt call lands in Cloud Audit Logs (the real answer to "who decrypted what")
+#   - rotation of the wrapping key is automatic; CI can use Workload Identity Federation (no key files)
+#
+# THIS LEVEL NEEDS A GCP PROJECT. CI only lints it (shellcheck); it cannot run without cloud credentials.
 #
 # Usage:
-#   export GCP_PROJECT=my-project
-#   export GCP_KMS_KEYRING=my-keyring
-#   export GCP_KMS_KEY=my-key
-#   export GCP_LOCATION=global
+#   export GCP_PROJECT=my-project            # required
+#   export GCP_LOCATION=global GCP_KMS_KEYRING=sops GCP_KMS_KEY=sops-key      # optional, shown values are the defaults
+#   export BREAKGLASS_AGE_PUBLIC_KEY=age1... # optional second recipient kept offline
 #   ./l2-encrypt-with-gcp-kms.sh
-#
-# Prerequisites:
-#   - sops: https://github.com/getsops/sops/releases
-#   - gcloud CLI authenticated: gcloud auth application-default login
-#   - KMS key created and IAM binding granted (roles/cloudkms.cryptoKeyEncrypterDecrypter)
+# Needs: sops >= 3.9, gcloud (authenticated: gcloud auth application-default login)
 # =============================================================================
 set -euo pipefail
 
-GCP_PROJECT="${GCP_PROJECT:-my-gcp-project}"
+: "${GCP_PROJECT:?set GCP_PROJECT}"
 GCP_LOCATION="${GCP_LOCATION:-global}"
-GCP_KEYRING="${GCP_KMS_KEYRING:-sops-keyring}"
+GCP_KEYRING="${GCP_KMS_KEYRING:-sops}"
 GCP_KEY="${GCP_KMS_KEY:-sops-key}"
 GCP_KMS_RESOURCE="projects/${GCP_PROJECT}/locations/${GCP_LOCATION}/keyRings/${GCP_KEYRING}/cryptoKeys/${GCP_KEY}"
+WORKDIR="${WORKDIR:-./sops-gcp-demo}"
+PLAINTEXT="${WORKDIR}/example-app-secret.yaml"
+ENCRYPTED="${WORKDIR}/example-app-secret.enc.yaml"
 
-SOPS_CONFIG=".sops.yaml"
-EXAMPLE_SECRET="example-app-secret.yaml"
-ENCRYPTED_SECRET="example-app-secret.enc.yaml"
+log() { printf '\n==> %s\n' "$*"; }
+die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-log()  { echo; echo "==> $*"; }
-cmd()  { echo "    \$ $*"; eval "$@"; }
-die()  { echo "[ERROR] $*" >&2; exit 1; }
+for tool in sops gcloud; do command -v "${tool}" >/dev/null || die "${tool} not found"; done
+mkdir -p "${WORKDIR}"
 
-check_dependencies() {
-    command -v sops   &>/dev/null || die "sops not found. Install: https://github.com/getsops/sops/releases"
-    command -v gcloud &>/dev/null || die "gcloud not found. Install: https://cloud.google.com/sdk/docs/install"
-}
-
-# =============================================================================
-# 1. Create GCP KMS key (if it doesn't exist)
-# =============================================================================
+# 1. Key ring + key. `describe` first: a failing create is a real error (permissions, quota, API disabled)
+#    and must not be mistaken for "already exists".
 setup_gcp_kms() {
-    log "Step 1: Set up GCP KMS key"
-    echo "    Project:  ${GCP_PROJECT}"
-    echo "    Location: ${GCP_LOCATION}"
-    echo "    Keyring:  ${GCP_KEYRING}"
-    echo "    Key:      ${GCP_KEY}"
-    echo "    Resource: ${GCP_KMS_RESOURCE}"
+  log "Step 1: KMS key ${GCP_KMS_RESOURCE}"
+  gcloud services enable cloudkms.googleapis.com --project="${GCP_PROJECT}"
 
-    # Enable KMS API
-    cmd "gcloud services enable cloudkms.googleapis.com --project=${GCP_PROJECT}" || true
+  if gcloud kms keyrings describe "${GCP_KEYRING}" --location="${GCP_LOCATION}" --project="${GCP_PROJECT}" >/dev/null 2>&1; then
+    echo "    keyring ${GCP_KEYRING} exists"
+  else
+    gcloud kms keyrings create "${GCP_KEYRING}" --location="${GCP_LOCATION}" --project="${GCP_PROJECT}"
+  fi
 
-    # Create keyring (idempotent)
-    cmd "gcloud kms keyrings create ${GCP_KEYRING} \
-        --location=${GCP_LOCATION} \
-        --project=${GCP_PROJECT}" 2>/dev/null || \
-        echo "    Keyring already exists — continuing"
+  if gcloud kms keys describe "${GCP_KEY}" --keyring="${GCP_KEYRING}" --location="${GCP_LOCATION}" --project="${GCP_PROJECT}" >/dev/null 2>&1; then
+    echo "    key ${GCP_KEY} exists"
+  else
+    local next_rotation
+    next_rotation="$(date -u -d '+90 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+90d +%Y-%m-%dT%H:%M:%SZ)"
+    gcloud kms keys create "${GCP_KEY}" --keyring="${GCP_KEYRING}" --location="${GCP_LOCATION}" \
+      --project="${GCP_PROJECT}" --purpose=encryption --rotation-period=90d --next-rotation-time="${next_rotation}"
+  fi
 
-    # Create symmetric encryption key (idempotent)
-    cmd "gcloud kms keys create ${GCP_KEY} \
-        --keyring=${GCP_KEYRING} \
-        --location=${GCP_LOCATION} \
-        --project=${GCP_PROJECT} \
-        --purpose=encryption \
-        --rotation-period=90d \
-        --next-rotation-time=$(date -d '+90 days' --iso-8601 2>/dev/null || date -v+90d +%Y-%m-%d)" 2>/dev/null || \
-        echo "    Key already exists — continuing"
-
-    # Grant current user encrypter/decrypter role
-    CURRENT_USER=$(gcloud config get-value account 2>/dev/null || echo "unknown")
-    echo "    Granting roles/cloudkms.cryptoKeyEncrypterDecrypter to ${CURRENT_USER}"
-    cmd "gcloud kms keys add-iam-policy-binding ${GCP_KEY} \
-        --keyring=${GCP_KEYRING} \
-        --location=${GCP_LOCATION} \
-        --project=${GCP_PROJECT} \
-        --member=user:${CURRENT_USER} \
-        --role=roles/cloudkms.cryptoKeyEncrypterDecrypter" || true
+  # The caller may be a user or a service account; the IAM member prefix differs.
+  local account member
+  account="$(gcloud config get-value account 2>/dev/null)"
+  [[ -n "${account}" ]] || die "no active gcloud account"
+  case "${account}" in
+    *.gserviceaccount.com) member="serviceAccount:${account}" ;;
+    *) member="user:${account}" ;;
+  esac
+  gcloud kms keys add-iam-policy-binding "${GCP_KEY}" --keyring="${GCP_KEYRING}" --location="${GCP_LOCATION}" \
+    --project="${GCP_PROJECT}" --member="${member}" --role=roles/cloudkms.cryptoKeyEncrypterDecrypter >/dev/null
+  echo "    ${member} can encrypt and decrypt"
 }
 
-# =============================================================================
-# 2. Create .sops.yaml for GCP KMS
-# =============================================================================
+# 2. .sops.yaml. Rules are first-match-wins, so the specific ones come before the catch-all.
 create_sops_config() {
-    log "Step 2: Create .sops.yaml for GCP KMS"
-
-    cat > "${SOPS_CONFIG}" <<EOF
-# .sops.yaml — SOPS with GCP KMS
-# Commit this file (contains only public key references, not secrets)
-
-creation_rules:
-  # Kubernetes secret manifests — encrypt with GCP KMS
-  - path_regex: .*secret.*\.ya?ml$
-    gcp_kms: ${GCP_KMS_RESOURCE}
-
-  # Multi-provider: use both GCP KMS and age for redundancy
-  # Either key can decrypt — useful for break-glass access
-  - path_regex: secrets/.*\.ya?ml$
-    gcp_kms: ${GCP_KMS_RESOURCE}
-    age: age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-  # Environment files
-  - path_regex: \.env\.(prod|staging)$
-    gcp_kms: ${GCP_KMS_RESOURCE}
-
-  # Default fallback
-  - path_regex: .*
-    gcp_kms: ${GCP_KMS_RESOURCE}
-EOF
-
-    echo "    Created ${SOPS_CONFIG}"
+  log "Step 2: .sops.yaml"
+  {
+    echo "creation_rules:"
+    echo "  - path_regex: .*secret.*\\.ya?ml\$"
+    echo "    encrypted_regex: ^(data|stringData)\$"
+    echo "    gcp_kms: ${GCP_KMS_RESOURCE}"
+    if [[ -n "${BREAKGLASS_AGE_PUBLIC_KEY:-}" ]]; then
+      echo "    age: ${BREAKGLASS_AGE_PUBLIC_KEY}     # either recipient can decrypt: break-glass access"
+    fi
+    echo "  - path_regex: .*\\.(ya?ml|json|env)\$"
+    echo "    gcp_kms: ${GCP_KMS_RESOURCE}"
+  } > "${WORKDIR}/.sops.yaml"
+  sed 's/^/    | /' "${WORKDIR}/.sops.yaml"
 }
 
-# =============================================================================
-# 3. Create example plaintext secret
-# =============================================================================
 create_example_secret() {
-    log "Step 3: Create example plaintext secret"
-
-    cat > "${EXAMPLE_SECRET}" <<'EOF'
+  log "Step 3: plaintext Secret (demo values)"
+  cat > "${PLAINTEXT}" <<'YAML'
 apiVersion: v1
 kind: Secret
 metadata:
@@ -130,101 +94,53 @@ metadata:
   namespace: myapp
 type: Opaque
 stringData:
-  db_password: "${DB_PASSWORD}"
-  gcs_bucket: "my-app-assets-bucket"
-  bigquery_dataset: "analytics_prod"
-  pubsub_topic: "projects/my-project/topics/events"
-  oauth_client_secret: "oauth-client-secret-value"
-EOF
-
-    echo "    Created ${EXAMPLE_SECRET}"
-}
-
-# =============================================================================
-# 4. Encrypt with GCP KMS
-# =============================================================================
-encrypt_with_gcp_kms() {
-    log "Step 4: Encrypt with GCP KMS"
-
-    # SOPS reads GCP credentials from Application Default Credentials (ADC)
-    # In CI, use Workload Identity (GKE) or service account key (legacy)
-    cmd "sops --encrypt \
-        --gcp-kms ${GCP_KMS_RESOURCE} \
-        ${EXAMPLE_SECRET} > ${ENCRYPTED_SECRET}"
-
-    echo "    Encrypted: ${ENCRYPTED_SECRET}"
-    echo "    Preview of encrypted file:"
-    head -20 "${ENCRYPTED_SECRET}"
-}
-
-# =============================================================================
-# 5. Decrypt
-# =============================================================================
-decrypt_with_gcp_kms() {
-    log "Step 5: Decrypt with GCP KMS"
-    cmd "sops --decrypt ${ENCRYPTED_SECRET}"
-}
-
-# =============================================================================
-# 6. Grant CI/CD service account access to KMS key
-# =============================================================================
-setup_ci_access() {
-    log "Step 6: Grant CI/CD service account KMS access"
-
-    local CI_SA="ci-deployer@${GCP_PROJECT}.iam.gserviceaccount.com"
-    echo "    CI service account: ${CI_SA}"
-    echo "    Run this to grant access:"
-    echo ""
-    echo "    gcloud kms keys add-iam-policy-binding ${GCP_KEY} \\"
-    echo "      --keyring=${GCP_KEYRING} \\"
-    echo "      --location=${GCP_LOCATION} \\"
-    echo "      --project=${GCP_PROJECT} \\"
-    echo "      --member=serviceAccount:${CI_SA} \\"
-    echo "      --role=roles/cloudkms.cryptoKeyEncrypterDecrypter"
-    echo ""
-    echo "    For GKE Workload Identity (no key files needed):"
-    echo "    gcloud iam service-accounts add-iam-policy-binding ${CI_SA} \\"
-    echo "      --role=roles/iam.workloadIdentityUser \\"
-    echo "      --member=serviceAccount:${GCP_PROJECT}.svc.id.goog[ci-namespace/ci-sa]"
-}
-
-# =============================================================================
-# 7. GitOps CI usage example
-# =============================================================================
-show_gitops_usage() {
-    log "Step 7: GitOps usage in CI pipeline"
-    echo ""
-    cat <<'YAML'
-# GitHub Actions example with GCP Workload Identity Federation
-- name: Authenticate to GCP
-  uses: google-github-actions/auth@v2
-  with:
-    workload_identity_provider: projects/123/locations/global/workloadIdentityPools/github/providers/github
-    service_account: ci-deployer@my-project.iam.gserviceaccount.com
-
-- name: Decrypt and apply secrets
-  run: |
-    sops --decrypt k8s/secrets/myapp.enc.yaml | kubectl apply -f -
+  db_password: "demo-password-not-real"
+  oauth_client_secret: "demo-client-secret-not-real"
 YAML
 }
 
-# --- Main --------------------------------------------------------------------
-main() {
-    check_dependencies
-    setup_gcp_kms
-    create_sops_config
-    create_example_secret
-    encrypt_with_gcp_kms
-    decrypt_with_gcp_kms
-    setup_ci_access
-    show_gitops_usage
+encrypt_and_decrypt() {
+  log "Step 4: encrypt, then decrypt through KMS"
+  sops --config "${WORKDIR}/.sops.yaml" encrypt "${PLAINTEXT}" > "${ENCRYPTED}"
+  grep -q '^    gcp_kms:' "${ENCRYPTED}" || die "KMS recipient missing from ${ENCRYPTED}"
+  local got
+  got="$(sops decrypt --extract '["stringData"]["db_password"]' "${ENCRYPTED}")"
+  [[ "${got}" == "demo-password-not-real" ]] || die "round trip failed"
+  echo "    round trip OK through ${GCP_KMS_RESOURCE}"
+}
 
-    echo ""
-    echo "=== SOPS + GCP KMS setup complete ==="
-    echo "    KMS Key:   ${GCP_KMS_RESOURCE}"
-    echo "    Config:    ${SOPS_CONFIG}"
-    echo "    Encrypted: ${ENCRYPTED_SECRET} (commit this)"
-    echo "    Plaintext: ${EXAMPLE_SECRET} (DO NOT commit)"
+setup_ci_access() {
+  log "Step 5: let CI decrypt (Workload Identity Federation, no key files)"
+  cat <<TXT
+    gcloud kms keys add-iam-policy-binding ${GCP_KEY} --keyring=${GCP_KEYRING} --location=${GCP_LOCATION} \\
+      --project=${GCP_PROJECT} --member=serviceAccount:ci-deployer@${GCP_PROJECT}.iam.gserviceaccount.com \\
+      --role=roles/cloudkms.cryptoKeyDecrypter       # CI only needs decrypt
+TXT
+}
+
+show_gitops_usage() {
+  log "Step 6: GitHub Actions"
+  cat <<'YAML'
+    permissions:
+      contents: read
+      id-token: write                                  # required for Workload Identity Federation
+    steps:
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093   # v3
+        with:
+          workload_identity_provider: projects/123456789/locations/global/workloadIdentityPools/github/providers/github
+          service_account: ci-deployer@my-project.iam.gserviceaccount.com
+      - run: sops decrypt k8s/secrets/myapp.enc.yaml | kubectl apply -f -
+YAML
+}
+
+main() {
+  setup_gcp_kms
+  create_sops_config
+  create_example_secret
+  encrypt_and_decrypt
+  setup_ci_access
+  show_gitops_usage
+  printf '\n=== SOPS + GCP KMS done ===\n    commit: %s and %s/.sops.yaml\n' "${ENCRYPTED}" "${WORKDIR}"
 }
 
 main "$@"

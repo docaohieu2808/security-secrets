@@ -1,134 +1,88 @@
 # =============================================================================
-# l1-install-helm-values.yaml — Falco Level 1: Helm install values
+# l1 - Falco: Helm install values (chart falco-9.2.1, Falco 0.45.1)
 #
-# Install Falco via Helm with sensible production defaults.
-#
-# Usage:
-#   helm repo add falcosecurity https://falcosecurity.github.io/charts
-#   helm repo update
-#   helm install falco falcosecurity/falco \
+#   helm repo add falcosecurity https://falcosecurity.github.io/charts && helm repo update
+#   helm install falco falcosecurity/falco --version 9.2.1 \
 #     --namespace falco --create-namespace \
-#     --values l1-install-helm-values.yaml
+#     -f l1-install-helm-values.yaml \
+#     --set-file customRules.custom-rules\\.yaml=l2-custom-rules.yaml
 #
-# Upgrade:
-#   helm upgrade falco falcosecurity/falco \
-#     --namespace falco \
-#     --values l1-install-helm-values.yaml
+# What changed in chart 9.x (Falco 0.44+), and why the old values break `helm install`:
+#   - driver.kind=ebpf (legacy probe) and the gVisor engine are gone. Use modern_ebpf (CO-RE, kernel >= 5.8,
+#     nothing to download or compile) or kmod. `auto` picks one for you.
+#   - the gRPC output/server (falco.grpc, falco.grpc_output) is gone. Use http_output (Falcosidekick does
+#     this for you), file_output or stdout_output.
+#   - `rules_file` (singular) was renamed `rules_files` in Falco 0.38.
+#   The chart refuses to render if a removed key is still present, so a stale values file fails fast.
+#
+# Runs on a real node kernel; it will not start inside kind/Docker Desktop VMs without BPF/BTF support.
+# CI therefore validates the chart render and the rules (`falco --validate`), not the live driver.
 # =============================================================================
 
-# --- Driver configuration ----------------------------------------------------
-# driver.kind: how Falco captures kernel syscalls
-#   ebpf    — modern, no kernel module required, works on GKE/EKS/AKS
-#   module  — traditional kernel module (requires privileged access)
-#   modern_ebpf — CO-RE eBPF, no probe download needed (kernel >= 5.8)
+# --- Driver ------------------------------------------------------------------
+# kind: auto | modern_ebpf | kmod
 driver:
-  kind: ebpf
-  ebpf:
-    # Path to the eBPF probe inside the container
-    path: ${HOME}/.falco/falco-bpf.o
-    # Automatically build probe if not found for this kernel version
-    leastPrivileged: false
+  kind: modern_ebpf
+  modernEbpf:
+    # true = run with CAP_BPF/CAP_PERFMON/CAP_SYS_RESOURCE/CAP_SYS_PTRACE instead of a privileged container
+    leastPrivileged: true
 
-# --- Falco core settings -----------------------------------------------------
+# --- Falco core settings (these map 1:1 to falco.yaml) -----------------------
 falco:
-  # Rules files loaded in order (later files override earlier ones)
-  rules_file:
+  rules_files:
     - /etc/falco/falco_rules.yaml
     - /etc/falco/falco_rules.local.yaml
-    - /etc/falco/rules.d
+    - /etc/falco/rules.d          # customRules (below) are mounted here
 
-  # Output channels — enable all for production
-  json_output: true                  # Structured JSON for log aggregation
-  json_include_output_property: true # Include 'output' field in JSON
+  json_output: true
+  json_include_output_property: true
   log_stderr: true
-  log_level: info                    # debug | info | notice | warning | error
+  log_level: info
+  priority: warning               # emergency | alert | critical | error | warning | notice | informational | debug
 
-  # Alert priority threshold — only alert on >= this level
-  # Levels: emergency, alert, critical, error, warning, notice, informational, debug
-  priority: warning
-
-  # gRPC output for Falcosidekick integration
-  grpc:
-    enabled: true
-    bind_address: "unix:///run/falco/falco.sock"
-    threadiness: 8
-
-  grpc_output:
+  # Alerts go to stdout (kubectl logs) and, via Falcosidekick below, to http_output.
+  stdout_output:
     enabled: true
 
-  # Buffered outputs reduce CPU usage at cost of slight delay
-  buffered_outputs: false
-
-  # Syscall event drops — what to do when the ring buffer is full
   syscall_event_drops:
-    actions:
-      - log
-      - alert
-    rate: 0.03333   # Max 1 drop alert per 30 seconds
+    actions: [log, alert]
+    rate: 0.03333                 # at most one drop alert per 30 s
     max_burst: 1
 
-# --- Falcosidekick sidecar ---------------------------------------------------
-# Falcosidekick forwards alerts to Slack, PagerDuty, Elasticsearch, etc.
+# --- Custom rules ------------------------------------------------------------
+# Inline example; the install command above feeds l2-custom-rules.yaml with --set-file instead.
+# customRules:
+#   custom-rules.yaml: |-
+#     - rule: ...
+
+# --- Falcosidekick: fan alerts out to Slack, Loki, Elasticsearch, PagerDuty... -
 falcosidekick:
   enabled: true
-  # Falcosidekick configuration — set webhook/integration URLs via Secret
   config:
     slack:
-      webhookurl: ""          # Set via: --set falcosidekick.config.slack.webhookurl=<url>
-      minimumpriority: warning
-    pagerduty:
-      routingkey: ""          # Set via Secret or --set
-      minimumpriority: critical
-    elasticsearch:
-      hostport: ""            # e.g. http://elasticsearch:9200
-      index: falco
+      webhookurl: ""              # --set falcosidekick.config.slack.webhookurl=<url>
       minimumpriority: warning
     loki:
-      hostport: ""            # e.g. http://loki:3100
+      hostport: ""                # for example http://loki.monitoring:3100
       minimumpriority: warning
   webui:
-    enabled: true             # Falcosidekick UI dashboard
+    enabled: true
     replicaCount: 1
 
-# --- Resource limits ---------------------------------------------------------
+# --- Resources / placement ---------------------------------------------------
 resources:
   requests:
     cpu: 100m
     memory: 256Mi
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: 1000m
+    memory: 1Gi
 
-# --- DaemonSet settings ------------------------------------------------------
-# Falco runs as a DaemonSet — one pod per node
+controller:
+  kind: daemonset                 # one pod per node
+
 tolerations:
-  # Run on control plane nodes too for full coverage
-  - key: node-role.kubernetes.io/control-plane
-    operator: Exists
-    effect: NoSchedule
-  - key: node-role.kubernetes.io/master
-    operator: Exists
-    effect: NoSchedule
+  - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
 
-# Required for kernel-level syscall capture
-securityContext:
-  privileged: true             # Needed for kernel module / eBPF probe loading
-
-# --- Metrics -----------------------------------------------------------------
 serviceMonitor:
-  create: false   # Set true if Prometheus Operator is installed
-
-# --- Node selector -----------------------------------------------------------
-nodeSelector: {}
-
-# --- Extra volumes for custom rules ------------------------------------------
-# Mount custom rules ConfigMap (see l2-custom-rules.yaml)
-extraVolumes:
-  - name: custom-rules
-    configMap:
-      name: falco-custom-rules
-
-extraVolumeMounts:
-  - name: custom-rules
-    mountPath: /etc/falco/rules.d
-    readOnly: true
+  create: false                   # true if the Prometheus Operator is installed

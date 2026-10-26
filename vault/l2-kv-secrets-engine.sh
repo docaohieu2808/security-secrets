@@ -1,162 +1,84 @@
 #!/usr/bin/env bash
 # =============================================================================
-# l2-kv-secrets-engine.sh — Vault: KV v2 secrets engine CRUD operations
+# l2 - Vault KV v2: write, read, patch, version, soft-delete, undelete, destroy, metadata
 #
-# Demonstrates full lifecycle of KV (Key-Value) v2 secrets engine:
-#   - Enable the engine at a custom mount path
-#   - Write, read, update, list, and delete secrets
-#   - Access specific versions, compare diffs between versions
-#   - Permanently destroy versions and metadata
-#   - Configure max versions and delete-version-after TTL
-#
-# Usage:
-#   export VAULT_ADDR=http://127.0.0.1:8200
-#   export VAULT_TOKEN=dev-root-token
+#   export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=dev-root-token
 #   ./l2-kv-secrets-engine.sh
 #
-# Prerequisites:
-#   - vault CLI installed: https://developer.hashicorp.com/vault/downloads
-#   - Vault server running (see l1-dev-server-docker-compose.yml)
+# KV v2 keeps versions of every secret: `put` replaces all fields (new version), `patch` changes some fields (new
+# version), `delete` is a soft delete you can undo, `destroy` wipes a version for good.
+# Re-runnable: it starts by removing its own demo secrets. Needs: vault, jq, openssl; a dev server from l1.
 # =============================================================================
 set -euo pipefail
+# shellcheck source=lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
-VAULT_TOKEN="${VAULT_TOKEN:-dev-root-token}"
-MOUNT_PATH="secret"           # KV engine mount path (dev server pre-mounts this)
-ALT_MOUNT="kv-apps"           # Custom mount path example
+MOUNT="kv-apps"           # the dev server already has `secret/`; this adds a second mount
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
 
-export VAULT_ADDR VAULT_TOKEN
+require vault "https://developer.hashicorp.com/vault/downloads"; require jq; require openssl
+wait_for_vault
 
-log()  { echo; echo "==> $*"; }
-cmd()  { echo "    \$ $*"; eval "$@"; }
+log "Step 1: enable KV v2 at ${MOUNT}/ and set defaults"
+ensure_mount "${MOUNT}" kv -version=2
+run vault write "${MOUNT}/config" max_versions=10 delete_version_after=720h
+vault secrets list -detailed | grep -E "^(Path|${MOUNT}/)" | sed 's/^/    /'
 
-# =============================================================================
-# 1. Enable KV v2 engine at a custom path
-# =============================================================================
-log "Step 1: Enable KV v2 secrets engine at path '${ALT_MOUNT}/'"
-# Dev server already has 'secret/' mounted — we create an additional mount
-cmd "vault secrets enable -path=${ALT_MOUNT} -version=2 kv" || \
-    echo "    (already enabled — continuing)"
+# start from a clean slate so the version numbers below are always 1, 2, 3
+if vault kv metadata get "${MOUNT}/myapp/database" >/dev/null 2>&1; then
+  vault kv metadata delete "${MOUNT}/myapp/database"
+fi
 
-# Configure max versions to retain per secret path
-cmd "vault write ${ALT_MOUNT}/config max_versions=10 delete_version_after=720h"
+log "Step 2: write secrets (version 1)"
+run vault kv put "${MOUNT}/myapp/database" host=postgres.internal port=5432 username=myapp_user \
+  password=initial-demo-password dbname=myapp
+run vault kv put "${MOUNT}/myapp/api-keys" payment_key=example-payment-key-not-real mail_key=example-mail-key-not-real
+# a file as the value: `key=@path` reads the file's contents
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=myapp.example.internal" \
+  -keyout "${WORK}/tls.key" -out "${WORK}/tls.crt" 2>/dev/null
+run vault kv put "${MOUNT}/myapp/tls" cert=@"${WORK}/tls.crt" key=@"${WORK}/tls.key"
+assert_eq "tls cert round-trips through @file" "$(vault kv get -field=cert "${MOUNT}/myapp/tls")" "$(cat "${WORK}/tls.crt")"
 
-# List all enabled secrets engines
-log "Enabled secrets engines:"
-cmd "vault secrets list -detailed"
+log "Step 3: read"
+run vault kv get "${MOUNT}/myapp/database"
+run vault kv get -format=json "${MOUNT}/myapp/database" | jq '.data.data'
+assert_eq "username" "$(vault kv get -field=username "${MOUNT}/myapp/database")" "myapp_user"
 
-# =============================================================================
-# 2. Write secrets — KV v2 uses 'vault kv put' not 'vault write'
-# =============================================================================
-log "Step 2: Write secrets (creates version 1)"
+log "Step 4: patch (version 2) then put (version 3)"
+run vault kv patch "${MOUNT}/myapp/database" password=rotated-demo-password-v2
+assert_eq "patch kept the other fields" "$(vault kv get -field=host "${MOUNT}/myapp/database")" "postgres.internal"
+run vault kv put "${MOUNT}/myapp/database" host=postgres.internal port=5432 username=myapp_user \
+  password=rotated-demo-password-v3 dbname=myapp
+assert_eq "current version" "$(vault kv metadata get -format=json "${MOUNT}/myapp/database" | jq -r '.data.current_version')" "3"
 
-# Write a database credential set
-cmd "vault kv put ${ALT_MOUNT}/myapp/database \
-    host=postgres.internal \
-    port=5432 \
-    username=myapp_user \
-    password=super-secret-db-pass \
-    dbname=myapp_production"
+log "Step 5: versions"
+run vault kv metadata get "${MOUNT}/myapp/database"
+assert_eq "version 1 still readable" "$(vault kv get -version=1 -field=password "${MOUNT}/myapp/database")" "initial-demo-password"
 
-# Write API credentials
-cmd "vault kv put ${ALT_MOUNT}/myapp/api-keys \
-    stripe_secret=sk_live_xxxxxxxxxxxx \
-    stripe_publishable=pk_live_xxxxxxxxxxxx \
-    sendgrid_api_key=SG.xxxxxxxxxx"
+log "Step 6: list"
+run vault kv list "${MOUNT}/myapp"
+run vault kv list "${MOUNT}/"
 
-# Write with JSON input (useful for complex values)
-cmd "vault kv put ${ALT_MOUNT}/myapp/tls \
-    cert=@/dev/null \
-    key=@/dev/null" || true   # placeholder — replace /dev/null with real paths
+log "Step 7: soft delete version 1, then undelete"
+run vault kv delete -versions=1 "${MOUNT}/myapp/database"
+deleted="$(vault kv metadata get -format=json "${MOUNT}/myapp/database" | jq -r '.data.versions["1"].deletion_time')"
+[[ -n "${deleted}" ]] || die "version 1 was not marked deleted"
+run vault kv undelete -versions=1 "${MOUNT}/myapp/database"
+assert_eq "version 1 is back" "$(vault kv get -version=1 -field=username "${MOUNT}/myapp/database")" "myapp_user"
 
-# =============================================================================
-# 3. Read secrets
-# =============================================================================
-log "Step 3: Read secrets"
+log "Step 8: destroy version 1 (irreversible)"
+run vault kv destroy -versions=1 "${MOUNT}/myapp/database"
+assert_eq "version 1 destroyed" "$(vault kv metadata get -format=json "${MOUNT}/myapp/database" | jq -r '.data.versions["1"].destroyed')" "true"
 
-# Read latest version
-cmd "vault kv get ${ALT_MOUNT}/myapp/database"
+log "Step 9: per-path metadata"
+run vault kv metadata put -max-versions=5 -delete-version-after=24h \
+  -custom-metadata=owner=platform-team -custom-metadata=environment=production "${MOUNT}/myapp/database"
+assert_eq "custom metadata" "$(vault kv metadata get -format=json "${MOUNT}/myapp/database" | jq -r '.data.custom_metadata.owner')" "platform-team"
 
-# Read as JSON (useful in scripts)
-cmd "vault kv get -format=json ${ALT_MOUNT}/myapp/database | jq '.data.data'"
+log "Step 10: remove every version and the metadata of the demo secrets"
+for path in database api-keys tls; do
+  run vault kv metadata delete "${MOUNT}/myapp/${path}"
+done
 
-# Read a specific field only
-cmd "vault kv get -field=username ${ALT_MOUNT}/myapp/database"
-
-# =============================================================================
-# 4. Update secrets — creates a new version, old version retained
-# =============================================================================
-log "Step 4: Update secrets (creates version 2)"
-
-# patch: only updates specified fields, leaves others unchanged (KV v2 only)
-cmd "vault kv patch ${ALT_MOUNT}/myapp/database \
-    password=new-rotated-password-v2"
-
-# put: replaces ALL fields (version 3 if used after patch above)
-cmd "vault kv put ${ALT_MOUNT}/myapp/database \
-    host=postgres.internal \
-    port=5432 \
-    username=myapp_user \
-    password=new-rotated-password-v3 \
-    dbname=myapp_production"
-
-# =============================================================================
-# 5. Version management
-# =============================================================================
-log "Step 5: Version management"
-
-# Show metadata — lists all versions with creation time and deletion status
-cmd "vault kv metadata get ${ALT_MOUNT}/myapp/database"
-
-# Read a specific version (version 1 — the original)
-cmd "vault kv get -version=1 ${ALT_MOUNT}/myapp/database"
-
-# =============================================================================
-# 6. List secrets
-# =============================================================================
-log "Step 6: List secrets at path"
-cmd "vault kv list ${ALT_MOUNT}/myapp"
-cmd "vault kv list ${ALT_MOUNT}/"
-
-# =============================================================================
-# 7. Soft-delete and undelete specific versions
-# =============================================================================
-log "Step 7: Soft-delete version 1 (recoverable)"
-
-# Soft delete marks version as deleted but data is retained and recoverable
-cmd "vault kv delete -versions=1 ${ALT_MOUNT}/myapp/database"
-
-# Verify version 1 is now marked deleted in metadata
-cmd "vault kv metadata get ${ALT_MOUNT}/myapp/database"
-
-# Undelete (restore) version 1
-cmd "vault kv undelete -versions=1 ${ALT_MOUNT}/myapp/database"
-log "Restored version 1:"
-cmd "vault kv get -version=1 ${ALT_MOUNT}/myapp/database"
-
-# =============================================================================
-# 8. Permanently destroy a version (irrecoverable)
-# =============================================================================
-log "Step 8: Permanently destroy version 1 (irrecoverable — data wiped)"
-cmd "vault kv destroy -versions=1 ${ALT_MOUNT}/myapp/database"
-cmd "vault kv metadata get ${ALT_MOUNT}/myapp/database"
-
-# =============================================================================
-# 9. Update metadata config for a specific secret path
-# =============================================================================
-log "Step 9: Configure per-path metadata"
-cmd "vault kv metadata put \
-    -max-versions=5 \
-    -delete-version-after=24h \
-    -custom-metadata=owner=platform-team \
-    -custom-metadata=environment=production \
-    ${ALT_MOUNT}/myapp/database"
-
-# =============================================================================
-# 10. Delete all versions and metadata (full cleanup)
-# =============================================================================
-log "Step 10: Delete all versions + metadata for a path (full wipe)"
-cmd "vault kv metadata delete ${ALT_MOUNT}/myapp/api-keys"
-
-log "KV v2 CRUD demo complete."
-log "Vault UI: ${VAULT_ADDR}/ui/vault/secrets/${ALT_MOUNT}/list"
+log "KV v2 demo complete. UI: ${VAULT_ADDR}/ui/vault/secrets/${MOUNT}/list"

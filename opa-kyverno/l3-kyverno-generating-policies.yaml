@@ -1,0 +1,141 @@
+# =============================================================================
+# l3 - Kyverno GeneratingPolicy: baseline resources for every new Namespace
+#
+# A GeneratingPolicy creates companion objects when a trigger object is created. Here the trigger is
+# a Namespace and the generated objects are a default-deny NetworkPolicy, DNS egress to kube-dns only,
+# and a LimitRange. (Replaces the legacy ClusterPolicy `generate:` rules, removed in Kyverno 1.20.)
+#
+# The background controller needs RBAC for the kinds it generates; Kyverno aggregates any ClusterRole
+# labelled rbac.kyverno.io/aggregate-to-background-controller. NetworkPolicy, LimitRange and
+# ResourceQuota are NOT in the default set, so the ClusterRole below is required.
+#
+#   kubectl apply -f l3-kyverno-generating-policies.yaml
+#   kubectl create namespace test-team && kubectl get networkpolicy,limitrange -n test-team
+# =============================================================================
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno:generate-namespace-baseline
+  labels:
+    rbac.kyverno.io/aggregate-to-background-controller: "true"
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, watch, create, update, delete]
+  - apiGroups: [""]
+    resources: [limitranges, resourcequotas]
+    verbs: [get, list, watch, create, update, delete]
+---
+apiVersion: policies.kyverno.io/v1
+kind: GeneratingPolicy
+metadata:
+  name: namespace-baseline
+  annotations:
+    policies.kyverno.io/title: Namespace Baseline (NetworkPolicy + LimitRange)
+    policies.kyverno.io/category: Network Security
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      New namespaces get a zero-trust network posture (deny all, then allow DNS to kube-dns only)
+      and default container limits. System namespaces are skipped.
+spec:
+  evaluation:
+    synchronize:
+      enabled: true          # recreate the generated objects if someone deletes or edits them
+    generateExisting:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [namespaces]
+  matchConditions:
+    - name: skip-system-namespaces
+      expression: >-
+        !(object.metadata.name in ['kube-system', 'kube-public', 'kube-node-lease', 'default', 'kyverno',
+        'gatekeeper-system', 'cert-manager', 'falco', 'monitoring', 'logging', 'local-path-storage'])
+  variables:
+    - name: targetNs
+      expression: object.metadata.name
+    - name: defaultDeny
+      expression: >-
+        {
+          "apiVersion": dyn("networking.k8s.io/v1"),
+          "kind": dyn("NetworkPolicy"),
+          "metadata": dyn({"name": "default-deny-all", "labels": {"kyverno-generated": "true"}}),
+          "spec": dyn({"podSelector": {}, "policyTypes": ["Ingress", "Egress"]})
+        }
+    - name: allowDns
+      expression: >-
+        {
+          "apiVersion": dyn("networking.k8s.io/v1"),
+          "kind": dyn("NetworkPolicy"),
+          "metadata": dyn({"name": "allow-dns-egress", "labels": {"kyverno-generated": "true"}}),
+          "spec": dyn({
+            "podSelector": {},
+            "policyTypes": ["Egress"],
+            "egress": [{
+              "to": [{
+                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}
+              }],
+              "ports": [{"port": 53, "protocol": "UDP"}, {"port": 53, "protocol": "TCP"}]
+            }]
+          })
+        }
+    - name: limitRange
+      expression: >-
+        {
+          "apiVersion": dyn("v1"),
+          "kind": dyn("LimitRange"),
+          "metadata": dyn({"name": "default-limit-range", "labels": {"kyverno-generated": "true"}}),
+          "spec": dyn({"limits": [{
+            "type": "Container",
+            "default": {"cpu": "500m", "memory": "256Mi"},
+            "defaultRequest": {"cpu": "100m", "memory": "128Mi"},
+            "max": {"cpu": "4", "memory": "4Gi"}
+          }]})
+        }
+  generate:
+    - expression: >-
+        generator.apply(variables.targetNs, [variables.defaultDeny, variables.allowDns, variables.limitRange])
+---
+# Production namespaces additionally get a ResourceQuota (trigger: label environment=production).
+apiVersion: policies.kyverno.io/v1
+kind: GeneratingPolicy
+metadata:
+  name: production-namespace-quota
+  annotations:
+    policies.kyverno.io/title: Default ResourceQuota for Production Namespaces
+    policies.kyverno.io/category: Resource Management
+    policies.kyverno.io/severity: medium
+spec:
+  evaluation:
+    synchronize:
+      enabled: true
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        environment: production
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [namespaces]
+  variables:
+    - name: targetNs
+      expression: object.metadata.name
+    - name: quota
+      expression: >-
+        {
+          "apiVersion": dyn("v1"),
+          "kind": dyn("ResourceQuota"),
+          "metadata": dyn({"name": "default-quota", "labels": {"kyverno-generated": "true"}}),
+          "spec": dyn({"hard": {
+            "requests.cpu": "4", "requests.memory": "8Gi", "limits.cpu": "8", "limits.memory": "16Gi",
+            "pods": "50", "services": "20", "persistentvolumeclaims": "10"
+          }})
+        }
+  generate:
+    - expression: generator.apply(variables.targetNs, [variables.quota])

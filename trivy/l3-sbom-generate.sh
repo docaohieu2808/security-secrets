@@ -1,137 +1,57 @@
 #!/usr/bin/env bash
 # =============================================================================
-# l3-sbom-generate.sh — Trivy Level 3: Generate Software Bill of Materials (SBOM)
+# l3 - Trivy: generate an SBOM (software bill of materials) and check it for known vulnerabilities
 #
-# Generates SBOM in CycloneDX or SPDX format for container images or filesystems.
-# SBOM documents all components, libraries, and dependencies in a software artifact.
+#   ./l3-sbom-generate.sh <image:tag | directory> [format] [output-dir]
+#   ./l3-sbom-generate.sh myapp:2.0.0 cyclonedx ./sbom
+#   ./l3-sbom-generate.sh ./app spdx-json ./sbom
 #
-# Usage:
-#   ./l3-sbom-generate.sh <image:tag|fs-path> [sbom-format] [output-dir]
-#
-# Examples:
-#   ./l3-sbom-generate.sh nginx:latest cyclonedx ./sbom-output
-#   ./l3-sbom-generate.sh myapp:2.0.0 spdx-json ./sbom-output
-#   ./l3-sbom-generate.sh /path/to/app cyclonedx ./sbom-output
-#
-# SBOM Formats:
-#   cyclonedx     — CycloneDX XML (default, widely supported)
-#   cyclonedx-json — CycloneDX JSON
-#   spdx          — SPDX tag-value format
-#   spdx-json     — SPDX JSON (preferred for tooling integration)
-#
-# Prerequisites:
-#   - trivy >= 0.38.0
+# Formats and the file they produce:
+#   cyclonedx  -> *.cdx.json   CycloneDX is JSON in Trivy (there is no XML output)
+#   spdx-json  -> *.spdx.json
+#   spdx       -> *.spdx       tag-value
+# The SBOM is then scanned with `trivy sbom`: you can scan what you shipped later, without the image.
+# Env: SBOM_EXIT_CODE (default 0 = report only; set 1 to fail on HIGH/CRITICAL findings in the SBOM)
 # =============================================================================
 set -euo pipefail
 
-# --- Configuration -----------------------------------------------------------
-TARGET="${1:-nginx:latest}"
-SBOM_FORMAT="${2:-cyclonedx}"       # cyclonedx, cyclonedx-json, spdx, spdx-json
+TARGET="${1:?usage: $0 <image:tag|directory> [format] [output-dir]}"
+FORMAT="${2:-cyclonedx}"
 OUTPUT_DIR="${3:-./sbom-output}"
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+SBOM_EXIT_CODE="${SBOM_EXIT_CODE:-0}"
 
-# Determine file extension from format
-case "${SBOM_FORMAT}" in
-    cyclonedx)      EXT="xml" ;;
-    cyclonedx-json) EXT="json" ;;
-    spdx)           EXT="spdx" ;;
-    spdx-json)      EXT="spdx.json" ;;
-    *)              EXT="json" ;;
+case "${FORMAT}" in
+  cyclonedx) EXT="cdx.json" ;;
+  spdx-json) EXT="spdx.json" ;;
+  spdx) EXT="spdx" ;;
+  *) printf '[ERROR] unsupported format %s (cyclonedx, spdx-json, spdx)\n' "${FORMAT}" >&2; exit 1 ;;
 esac
 
-# Sanitize target name for use in filename (replace / and : with -)
-TARGET_SLUG=$(echo "${TARGET}" | tr '/: ' '---')
-SBOM_FILE="${OUTPUT_DIR}/sbom-${TARGET_SLUG}-${TIMESTAMP}.${EXT}"
+log() { printf '[INFO]  %s\n' "$*"; }
+die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-# --- Helpers -----------------------------------------------------------------
-log()  { echo "[INFO]  $*"; }
-warn() { echo "[WARN]  $*" >&2; }
-die()  { echo "[ERROR] $*" >&2; exit 1; }
+command -v trivy >/dev/null || die "trivy not found; run ./install-trivy.sh"
+mkdir -p "${OUTPUT_DIR}"
+slug="$(printf '%s' "${TARGET}" | tr '/: ' '---' | tr -s '-')"
+SBOM_FILE="${OUTPUT_DIR}/sbom-${slug}.${EXT}"
 
-check_dependencies() {
-    command -v trivy &>/dev/null || die "trivy not found. Install: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin"
-}
+if [[ -e "${TARGET}" ]]; then
+  log "generating ${FORMAT} SBOM for directory ${TARGET}"
+  trivy fs --format "${FORMAT}" --output "${SBOM_FILE}" "${TARGET}"
+else
+  log "generating ${FORMAT} SBOM for image ${TARGET}"
+  trivy image --format "${FORMAT}" --output "${SBOM_FILE}" "${TARGET}"
+fi
+log "wrote ${SBOM_FILE} ($(du -h "${SBOM_FILE}" | cut -f1))"
 
-print_banner() {
-    echo "=============================================="
-    echo " Trivy SBOM Generator"
-    echo "=============================================="
-    echo " Target   : ${TARGET}"
-    echo " Format   : ${SBOM_FORMAT}"
-    echo " Output   : ${SBOM_FILE}"
-    echo "=============================================="
-}
+if [[ "${EXT}" == "cdx.json" || "${EXT}" == "spdx.json" ]]; then
+  if command -v jq >/dev/null; then
+    key=$([[ "${EXT}" == "cdx.json" ]] && echo '.components' || echo '.packages')
+    log "components catalogued: $(jq "${key} | length" "${SBOM_FILE}")"
+  fi
+fi
 
-detect_target_type() {
-    # Determine if target is a container image or filesystem path
-    if [[ -d "${TARGET}" ]] || [[ -f "${TARGET}" ]]; then
-        echo "fs"
-    else
-        echo "image"
-    fi
-}
-
-generate_sbom_for_image() {
-    log "Generating SBOM for container image: ${TARGET}"
-    # --format cyclonedx/spdx-json: standard SBOM output format
-    # --scanners: empty string = skip vuln scan, only collect component inventory
-    trivy image \
-        --format "${SBOM_FORMAT}" \
-        --output "${SBOM_FILE}" \
-        --quiet \
-        "${TARGET}"
-}
-
-generate_sbom_for_filesystem() {
-    log "Generating SBOM for filesystem path: ${TARGET}"
-    trivy fs \
-        --format "${SBOM_FORMAT}" \
-        --output "${SBOM_FILE}" \
-        --quiet \
-        "${TARGET}"
-}
-
-print_sbom_summary() {
-    log "SBOM Summary:"
-    if command -v jq &>/dev/null && [[ "${EXT}" == "json" ]]; then
-        local component_count
-        component_count=$(jq '.components | length' "${SBOM_FILE}" 2>/dev/null || echo "unknown")
-        log "  Components catalogued: ${component_count}"
-    fi
-    log "  File: ${SBOM_FILE}"
-    log "  Size: $(du -sh "${SBOM_FILE}" | cut -f1)"
-}
-
-# --- Main --------------------------------------------------------------------
-main() {
-    check_dependencies
-    print_banner
-
-    mkdir -p "${OUTPUT_DIR}"
-
-    local target_type
-    target_type=$(detect_target_type)
-
-    if [[ "${target_type}" == "fs" ]]; then
-        generate_sbom_for_filesystem
-    else
-        log "Updating Trivy vulnerability database..."
-        trivy image --download-db-only --quiet
-        generate_sbom_for_image
-    fi
-
-    log "SBOM generated successfully."
-    print_sbom_summary
-
-    # Optional: also scan the generated SBOM for known vulnerabilities
-    log "Scanning SBOM for known vulnerabilities..."
-    trivy sbom \
-        --severity HIGH,CRITICAL \
-        --format table \
-        --exit-code 0 \
-        "${SBOM_FILE}" || true
-
-    log "Done. SBOM saved to: ${SBOM_FILE}"
-}
-
-main "$@"
+log "scanning the SBOM for HIGH/CRITICAL vulnerabilities"
+rc=0
+trivy sbom --severity HIGH,CRITICAL --exit-code "${SBOM_EXIT_CODE}" "${SBOM_FILE}" || rc=$?
+exit "${rc}"

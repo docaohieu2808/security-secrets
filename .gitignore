@@ -1,6 +1,8 @@
 # Secrets and credentials - NEVER commit these
 *.key
 *.pem
+# a Sealed Secrets certificate is public by design
+!sealed-secrets-public-key.pem
 *.p12
 *.pfx
 *.jks
@@ -65,3 +67,16 @@ audit.log
 *.bak
 tmp/
 temp/
+
+# Output directories of the lab scripts
+sealed-output/
+sops-demo/
+sops-gcp-demo/
+pki-output/
+trivy-reports/
+sbom-output/
+.scannerwork/
+.venv/
+work/
+actionlint
+opa-kyverno/l1-gatekeeper/tests/generated/
