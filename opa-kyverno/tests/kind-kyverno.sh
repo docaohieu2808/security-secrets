@@ -31,8 +31,20 @@ for crd in validatingpolicies mutatingpolicies generatingpolicies; do
 done
 pass "ValidatingPolicy / MutatingPolicy / GeneratingPolicy are served at policies.kyverno.io/v1"
 
-kubectl apply -f "${HERE}/l2-kyverno-validating-and-mutating-policies.yaml"
-kubectl apply -f "${HERE}/l3-kyverno-generating-policies.yaml"
+# The admission controller's pod is Ready before its policy-validation webhook answers; retry for up to a minute
+# and show the last error if it never does.
+apply_policies() {
+  local file="$1" out
+  for _ in $(seq 1 30); do
+    if out="$(kubectl apply -f "${file}" 2>&1)"; then printf '%s\n' "${out}"; return 0; fi
+    sleep 2
+  done
+  printf '%s\n' "${out}" >&2
+  fail "could not apply ${file}"
+}
+kubectl -n kyverno wait --for=condition=Ready pod -l app.kubernetes.io/component=admission-controller --timeout=180s
+apply_policies "${HERE}/l2-kyverno-validating-and-mutating-policies.yaml"
+apply_policies "${HERE}/l3-kyverno-generating-policies.yaml"
 kubectl wait --for=jsonpath='{.status.conditionStatus.ready}'=true validatingpolicy --all --timeout=180s
 kubectl wait --for=jsonpath='{.status.conditionStatus.ready}'=true mutatingpolicy --all --timeout=180s
 kubectl wait --for=jsonpath='{.status.conditionStatus.ready}'=true generatingpolicy --all --timeout=180s

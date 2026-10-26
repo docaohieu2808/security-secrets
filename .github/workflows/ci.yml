@@ -301,7 +301,7 @@ jobs:
             -e BAO_DEV_ROOT_TOKEN_ID=dev-root-token -e BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200 openbao/openbao:2.7.1 server -dev
           mkdir -p "$HOME/.local/bin"
           cid=$(docker create openbao/openbao:2.7.1)
-          docker cp "$cid:/bin/bao" "$HOME/.local/bin/vault"
+          docker cp "$cid:/usr/bin/bao" "$HOME/.local/bin/vault"
           docker rm "$cid"
           for _ in $(seq 1 30); do docker exec postgres pg_isready -U postgres -d myapp && break; sleep 1; done
       - name: Labs l2 to l5
@@ -350,7 +350,8 @@ jobs:
         run: docker compose -f sonarqube/l1-docker-compose-sonarqube.yml up -d --wait --wait-timeout 420
       - name: Labs l1 to l3 end to end
         run: |
-          SONAR_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+          # SonarQube demands upper, lower, digit and special character, at least 12 long
+          SONAR_ADMIN_PASSWORD="Aa1-$(openssl rand -hex 14)"
           echo "::add-mask::$SONAR_ADMIN_PASSWORD"
           export SONAR_ADMIN_PASSWORD
           sonarqube/tests/e2e.sh

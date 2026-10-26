@@ -30,8 +30,8 @@ umask 077
 log()  { printf '\n==> %s\n' "$*"; }
 info() { printf '    [INFO] %s\n' "$*"; }
 die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
-# Print the command, then run it. "$@" (not eval) keeps quoting intact.
-run()  { printf '    $ %s\n' "$*"; "$@"; }
+# Print the command (to stderr: stdout is often redirected into a file), then run it. "$@" (not eval) keeps quoting intact.
+run()  { printf '    $ %s\n' "$*" >&2; "$@"; }
 
 for tool in kubectl kubeseal openssl; do
   command -v "${tool}" >/dev/null || die "${tool} not found (kubeseal: see l1-install-controller.yaml)"

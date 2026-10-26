@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SonarQube labs end to end, as CI does it. The stack from l1 must be up and healthy:
 #   docker compose -f sonarqube/l1-docker-compose-sonarqube.yml up -d --wait
-#   SONAR_ADMIN_PASSWORD='something-long' sonarqube/tests/e2e.sh
+#   SONAR_ADMIN_PASSWORD='Choose-A-Long-0ne!' sonarqube/tests/e2e.sh   # >= 12 chars: upper, lower, digit, special
 # Proves: bootstrap (password change + token), quality gate import with the current API parameters, a clean project
 # passes the gate, a project with deliberate problems FAILS it and the script's exit code says so.
 set -euo pipefail

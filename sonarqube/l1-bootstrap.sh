@@ -5,7 +5,7 @@
 # A new SonarQube accepts admin/admin. This script waits until the server is UP, replaces that password,
 # and prints ONE analysis token to stdout (everything else goes to stderr), so it can be captured:
 #
-#   export SONAR_ADMIN_PASSWORD='choose-a-long-one'
+#   export SONAR_ADMIN_PASSWORD='Choose-A-Long-0ne!'   # >= 12 chars: upper, lower, digit, special
 #   SONAR_TOKEN="$(./l1-bootstrap.sh)"
 #
 # Env: SONAR_HOST_URL (default http://localhost:9000), SONAR_ADMIN_PASSWORD (required),
@@ -29,14 +29,22 @@ for _ in $(seq 1 60); do
 done
 curl -sf "${SONAR_HOST_URL}/api/system/status" | grep -q '"status":"UP"' || { log "server never reached UP"; exit 1; }
 
-# Current API: login + password + previousPassword. Returns 204 on success, 400/401 if already changed.
-code="$(curl -s -o /dev/null -w '%{http_code}' -u "admin:admin" -X POST "${SONAR_HOST_URL}/api/users/change_password" \
-  --data-urlencode "login=admin" --data-urlencode "previousPassword=admin" --data-urlencode "password=${SONAR_ADMIN_PASSWORD}")"
-case "${code}" in
-  204) log "default admin password replaced" ;;
-  400|401) log "default password already changed (HTTP ${code}); using SONAR_ADMIN_PASSWORD" ;;
-  *) log "change_password returned HTTP ${code}"; exit 1 ;;
-esac
+# Current API: login + password + previousPassword. The new password must have >= 12 characters with an uppercase
+# letter, a lowercase letter, a digit and a special character, and differ from the old one.
+valid="$(curl -s -u "admin:${SONAR_ADMIN_PASSWORD}" "${SONAR_HOST_URL}/api/authentication/validate" | jq -r '.valid')"
+if [[ "${valid}" == "true" ]]; then
+  log "admin already uses SONAR_ADMIN_PASSWORD"
+else
+  body="$(mktemp)"
+  trap 'rm -f "${body}"' EXIT
+  code="$(curl -s -o "${body}" -w '%{http_code}' -u "admin:admin" -X POST "${SONAR_HOST_URL}/api/users/change_password" \
+    --data-urlencode "login=admin" --data-urlencode "previousPassword=admin" --data-urlencode "password=${SONAR_ADMIN_PASSWORD}")"
+  if [[ "${code}" != "204" ]]; then
+    log "change_password returned HTTP ${code}: $(cat "${body}")"
+    exit 1
+  fi
+  log "default admin password replaced"
+fi
 
 # Revoke a leftover token of the same name (ignore 'not found'), then mint a new one.
 curl -s -o /dev/null -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_HOST_URL}/api/user_tokens/revoke" \

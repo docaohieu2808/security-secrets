@@ -118,7 +118,7 @@ opa-kyverno/tests/kind-kyverno.sh
 
 # SonarQube (needs vm.max_map_count=524288 on the host)
 docker compose -f sonarqube/l1-docker-compose-sonarqube.yml up -d --wait
-SONAR_ADMIN_PASSWORD=choose-a-long-one sonarqube/tests/e2e.sh
+SONAR_ADMIN_PASSWORD='Choose-A-Long-0ne!' sonarqube/tests/e2e.sh
 ```
 
 ## What CI checks (`.github/workflows/ci.yml`)
