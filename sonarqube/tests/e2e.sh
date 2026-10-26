@@ -33,6 +33,19 @@ pass "clean-app: scanner exited 0, gate OK"
 echo "== project with deliberate problems must fail =="
 rc=0
 ( cd "${HERE}/fixtures/bad" && "${HERE}/l3-scanner-ci-integration.sh" bad-app "Bad App" src ) || rc=$?
+# informational only: what SonarQube thinks of bad-app, for the log
+diag() { # <description> <api path with query> <jq filter>
+  local out
+  if out="$(curl -sf -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}$2" | jq -r "$3")"; then
+    printf '   %s\n%s\n' "$1" "${out}"
+  else
+    printf '   %s: request failed\n' "$1"
+  fi
+}
+diag "issues" "/api/issues/search?componentKeys=bad-app&ps=50" '.issues[] | "     \(.rule) \(.severity) \(.type)"'
+diag "hotspots" "/api/hotspots/search?projectKey=bad-app" '.hotspots[] | "     \(.ruleKey) \(.status)"'
+diag "measures" "/api/measures/component?component=bad-app&metricKeys=new_violations,new_security_hotspots,new_security_hotspots_reviewed,new_coverage,new_security_rating,new_software_quality_security_rating" '.component.measures | tostring'
+diag "gate" "/api/qualitygates/project_status?projectKey=bad-app" '.projectStatus | tostring'
 [[ ${rc} -ne 0 ]] || fail "bad-app passed the gate"
 status="$(curl -sf -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=bad-app" | jq -r '.projectStatus.status')"
 [[ "${status}" == "ERROR" ]] || fail "bad-app gate is ${status}, expected ERROR"

@@ -21,8 +21,16 @@ docker run --rm --entrypoint falco -v "${HERE}:/r:ro" "${FALCO_IMAGE}" \
   -V /etc/falco/falco_rules.yaml -V /r/l2-custom-rules.yaml 2>&1 | grep -v 'libs\]' | tail -6
 
 echo "== 2. k8s audit rules (plugin + stock rules fetched with falcoctl)"
-docker run --rm --user 0:0 -v "${WORK}:/p" "${FALCOCTL_IMAGE}" artifact install k8saudit:0.16 k8saudit-rules:0.16 json:0.7 \
-  --plugins-dir /p --rulesfiles-dir /p >/dev/null
+# the artifacts come from ghcr.io; retry a few times because a registry hiccup is not a rule problem
+for attempt in 1 2 3; do
+  if docker run --rm --user 0:0 -v "${WORK}:/p" "${FALCOCTL_IMAGE}" artifact install k8saudit:0.16 k8saudit-rules:0.16 json:0.7 \
+      --plugins-dir /p --rulesfiles-dir /p; then
+    break
+  fi
+  [[ ${attempt} -lt 3 ]] || { echo "falcoctl could not fetch the plugin after 3 attempts" >&2; exit 1; }
+  echo "falcoctl failed (attempt ${attempt}), retrying in 10s" >&2
+  sleep 10
+done
 # the rules live inside the Helm values file; extract them so there is one source of truth
 yq '.customRules."k8saudit-custom.yaml"' "${HERE}/l-max-falco-plugin-config.yaml" > "${WORK}/lab_k8saudit.yaml"
 cat > "${WORK}/falco-plugins.yaml" <<'YAML'
