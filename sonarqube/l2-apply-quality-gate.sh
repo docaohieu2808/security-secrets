@@ -46,6 +46,14 @@ fi
 api qualitygates/create --data-urlencode "name=${name}" >/dev/null
 echo "created gate '${name}'"
 
+# A new gate is not necessarily empty (current versions start it with the recommended conditions), and a second
+# condition on the same metric is refused, so clear whatever came with it: the JSON file is the whole truth.
+while read -r condition_id; do
+  [[ -n "${condition_id}" ]] || continue
+  api qualitygates/delete_condition --data-urlencode "id=${condition_id}" >/dev/null
+  echo "  removed pre-existing condition ${condition_id}"
+done < <(curl -sf -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/show?name=$(jq -rn --arg n "${name}" '$n|@uri')" | jq -r '.conditions[]?.id')
+
 while IFS=$'\t' read -r metric op error; do
   api qualitygates/create_condition --data-urlencode "gateName=${name}" \
     --data-urlencode "metric=${metric}" --data-urlencode "op=${op}" --data-urlencode "error=${error}" >/dev/null
