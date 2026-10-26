@@ -136,7 +136,7 @@ SONAR_ADMIN_PASSWORD='Choose-A-Long-0ne!' sonarqube/tests/e2e.sh
 | sops | age round trip, only `data`/`stringData` encrypted, a stranger's key fails, per-environment rules match the plaintext input path, dev key cannot read prod, `rotate-keys` changes the MAC and files still decrypt |
 | vault | Vault 2.2.1 **and** OpenBao 2.7.1 (`bao` installed as `vault`): l2 to l5 with assertions, including the revoked database user being unable to log in |
 | trivy | tampered checksum rejected; vulnerable image exits 1 and names its CVEs; clean image exits 0; bad IaC exits 1 with the expected IDs; custom Rego checks fire; SBOM is valid CycloneDX |
-| sonarqube | Community Build + PostgreSQL: bootstrap, gate import (9 conditions, default), clean project OK, bad project ends with gate ERROR and a non-zero exit |
+| sonarqube | Community Build + PostgreSQL: bootstrap, gate import (9 conditions, default), each project scanned twice (1.0 baseline, 1.1 change): the clean change passes with conditions actually evaluated, the bad change ends with gate ERROR and a non-zero exit |
 
 ### Limits (stated, not hidden)
 - **Falco's live driver is not run.** A hosted runner cannot be expected to load a kernel driver; the rules and chart output are
@@ -145,10 +145,13 @@ SONAR_ADMIN_PASSWORD='Choose-A-Long-0ne!' sonarqube/tests/e2e.sh
   shellchecked / schema-validated only.
 - **Constraints** (`K8sRequiredLabels`...) are skipped by kubeconform because their CRDs are created by the templates at runtime;
   `gator verify` covers them instead.
-- SonarQube Community Build has no branch or pull-request analysis; the l3 script only passes those parameters if you set
+- A SonarQube gate on *new code* has nothing to judge on a project's first analysis (the status has no conditions and passes),
+  which is why CI scans a baseline version first. Community Build has no branch or pull-request analysis; the l3 script only passes those parameters if you set
   `BRANCH_NAME` / `PR_KEY`, for use with a paid edition.
 - The Sealed Secrets controller is pinned to 0.40.0 (the chart default) because the 0.41.1 image was not on Docker Hub when this was
   written; bump `image.tag` and `KUBESEAL_VERSION` together once it is.
+- Dependabot watches the GitHub Actions and the Python helpers. Image tags inside the compose files and `install-tools.sh` /
+  `install-trivy.sh` are pinned by hand (Dependabot cannot read them); the weekly CI run is what notices a release that breaks a lab.
 - Dev-mode Vault, plain HTTP database connections (`sslmode=disable`) and fixed demo passwords are lab conveniences. Production
   Vault needs Raft storage, TLS, auto-unseal and an audit device; none of that is exercised here.
 
