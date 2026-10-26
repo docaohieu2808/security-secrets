@@ -93,6 +93,9 @@ spec:
 ---
 # 3. Mutable tags must be re-pulled. Previously this policy only matched `*:latest` and never looked
 # at imagePullPolicy; it now checks both, and also catches images with no tag at all.
+# Note: the API server defaults imagePullPolicy to Always for :latest / untagged images before admission runs, so in a
+# live cluster this denies explicit IfNotPresent / Never. `kyverno test` has no defaulting, so it also flags an
+# untagged pod that sets no policy at all.
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:

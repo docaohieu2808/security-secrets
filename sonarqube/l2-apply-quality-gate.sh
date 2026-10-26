@@ -18,9 +18,17 @@ CONFIG="${1:-$(dirname "$0")/l2-quality-gate-config.json}"
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 [[ -f "${CONFIG}" ]] || { echo "no such file: ${CONFIG}" >&2; exit 1; }
 
-api() { # <endpoint> <curl --data-urlencode args...> ; fails on any HTTP error and prints the body to stderr
-  local endpoint="$1"; shift
-  curl -sS --fail-with-body -u "${SONAR_TOKEN}:" -X POST "${SONAR_HOST_URL}/api/${endpoint}" "$@"
+api() { # <endpoint> <curl --data-urlencode args...> ; fails on any HTTP error and shows the server's explanation
+  local endpoint="$1" body code; shift
+  body="$(mktemp)"
+  code="$(curl -sS -o "${body}" -w '%{http_code}' -u "${SONAR_TOKEN}:" -X POST "${SONAR_HOST_URL}/api/${endpoint}" "$@")"
+  if [[ "${code}" != 2* ]]; then
+    printf 'HTTP %s from %s: %s\n' "${code}" "${endpoint}" "$(cat "${body}")" >&2
+    rm -f "${body}"
+    return 1
+  fi
+  cat "${body}"
+  rm -f "${body}"
 }
 
 name="$(jq -r '.qualityGate.name' "${CONFIG}")"

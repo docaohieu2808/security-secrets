@@ -68,10 +68,14 @@ pass "namespace with team + environment=dev: admitted"
 
 echo "== pods =="
 expect_denied "pod nginx:latest with imagePullPolicy IfNotPresent" kubectl -n shop run bad-latest --image=nginx:latest --image-pull-policy=IfNotPresent
-expect_denied "pod with an untagged image" kubectl -n shop run bad-untagged --image=nginx
+expect_denied "pod with an untagged image and imagePullPolicy IfNotPresent" kubectl -n shop run bad-untagged --image=nginx --image-pull-policy=IfNotPresent
+# The API server defaults imagePullPolicy to Always for an untagged or :latest image BEFORE admission, so the
+# policy only bites on an explicit IfNotPresent/Never (the offline `kyverno test` has no defaulting, which is why
+# the same untagged pod fails there).
+kubectl -n shop run good-untagged-defaulted --image=nginx --restart=Never
 kubectl -n shop run good-pinned --image=nginx:1.27 --restart=Never
 kubectl -n shop run good-latest-always --image=nginx:latest --image-pull-policy=Always --restart=Never
-pass "pinned tag and :latest+Always: admitted"
+pass "pinned tag, :latest+Always and an untagged image (defaulted to Always): admitted"
 
 echo "== deployments (validate + mutate) =="
 expect_denied "deployment missing the standard labels" kubectl -n shop create deployment bare --image=nginx:1.27

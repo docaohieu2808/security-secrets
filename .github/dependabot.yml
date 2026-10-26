@@ -1,11 +1,8 @@
+# The Dockerfile in trivy/fixtures/image is a deliberately vulnerable fixture and is not watched on purpose.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /trivy/fixtures/image
     schedule:
       interval: weekly
   - package-ecosystem: pip
